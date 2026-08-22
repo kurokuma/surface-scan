@@ -70,6 +70,8 @@ fn metadata(settings: &Settings) -> ScanMetadata {
         fingerprint_concurrency: settings.fingerprint_concurrency,
         host_concurrency: settings.host_concurrency,
         queue_depth: settings.queue_depth,
+        worker_threads: settings.worker_threads,
+        processes: settings.processes,
         tcp_timeout_ms: 200,
         tcp_retries: 0,
         tls_timeout_ms: 200,
@@ -121,10 +123,28 @@ async fn an_interrupted_host_is_not_checkpointed_as_completed() {
         "interrupted host must be rescanned on resume, got {:?}",
         saved.completed_hosts
     );
+    assert_eq!(
+        saved.output_position, 0,
+        "resume must roll back the partial host record"
+    );
 
     // The partial result is still written, so nothing observed is thrown away.
     let written = std::fs::read_to_string(&jsonl).unwrap();
     let host: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
     assert_eq!(host["ip"], "192.0.2.1");
     assert_eq!(host["scan"]["complete"], false);
+
+    let mut resumed = OutputWriters::open_at(
+        &jsonl,
+        None,
+        None,
+        None,
+        None,
+        true,
+        Some(saved.output_position),
+    )
+    .unwrap();
+    resumed.flush().unwrap();
+    drop(resumed);
+    assert!(std::fs::read(&jsonl).unwrap().is_empty());
 }

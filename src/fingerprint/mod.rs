@@ -278,6 +278,7 @@ impl FingerprintEngine {
             let classification = service.classification.as_deref().unwrap_or("unknown_tls");
             let (score, reasons) = suspicion_score(
                 &SuspicionInput {
+                    is_web: service.is_web(),
                     port: service.port,
                     server: service.server.as_deref(),
                     classification,
@@ -304,6 +305,8 @@ impl FingerprintEngine {
 /// Inputs to the triage score, kept as a struct so callers cannot transpose the
 /// boolean arguments by accident.
 pub struct SuspicionInput<'a> {
+    /// True only when an HTTP response body/favicon could actually be observed.
+    pub is_web: bool,
     pub port: u16,
     pub server: Option<&'a str>,
     pub classification: &'a str,
@@ -373,7 +376,7 @@ pub fn suspicion_score(input: &SuspicionInput<'_>, w: &SuspicionWeights) -> (u32
             &mut reasons,
         );
     }
-    if input.fingerprints.is_empty() && !input.favicon_known {
+    if input.is_web && input.fingerprints.is_empty() && !input.favicon_known {
         add(
             w.unknown_fingerprint,
             "unknown favicon/body fingerprint",
@@ -495,6 +498,7 @@ mod tests {
         let weights = SuspicionWeights::default();
         let (score, reasons) = suspicion_score(
             &SuspicionInput {
+                is_web: true,
                 port: 27331,
                 server: Some("HFS 2.3m"),
                 classification: "directory_listing",
@@ -520,6 +524,7 @@ mod tests {
     fn unknown_surface_earns_the_unknown_fingerprint_bonus() {
         let (score, reasons) = suspicion_score(
             &SuspicionInput {
+                is_web: true,
                 port: 443,
                 server: Some("nginx/1.24.0"),
                 classification: "generic_web",
@@ -533,5 +538,25 @@ mod tests {
         );
         assert_eq!(score, 2, "{reasons:?}");
         assert!(reasons.iter().any(|r| r.contains("unknown favicon")));
+    }
+
+    #[test]
+    fn tls_only_service_does_not_receive_a_web_fingerprint_bonus() {
+        let (score, reasons) = suspicion_score(
+            &SuspicionInput {
+                is_web: false,
+                port: 3389,
+                server: None,
+                classification: "unknown_tls",
+                fingerprints: &[],
+                tls_self_signed: true,
+                tls_expired: false,
+                body: "",
+                favicon_known: false,
+            },
+            &SuspicionWeights::default(),
+        );
+        assert_eq!(score, 2, "{reasons:?}");
+        assert!(!reasons.iter().any(|r| r.contains("unknown favicon")));
     }
 }

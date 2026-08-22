@@ -96,7 +96,7 @@ impl FingerprintToggles {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub scan_mode: ScanMode,
     pub ports: Vec<u16>,
@@ -109,6 +109,8 @@ pub struct Settings {
     pub fingerprint_concurrency: usize,
     pub host_concurrency: usize,
     pub queue_depth: usize,
+    pub worker_threads: usize,
+    pub processes: usize,
     pub tcp_timeout: Duration,
     pub tcp_retries: u32,
     pub http_timeout: Duration,
@@ -155,6 +157,8 @@ pub struct ScanConfig {
     pub concurrency: Option<usize>,
     pub host_concurrency: Option<usize>,
     pub queue_depth: Option<usize>,
+    pub worker_threads: Option<usize>,
+    pub processes: Option<usize>,
     pub tcp_timeout_ms: Option<u64>,
     pub tcp_retries: Option<u32>,
 }
@@ -232,6 +236,15 @@ impl Settings {
                 .or(file.scan.host_concurrency)
                 .unwrap_or(default_host_concurrency),
             queue_depth: cli.queue_depth.or(file.scan.queue_depth).unwrap_or(64),
+            worker_threads: cli
+                .worker_threads
+                .or(file.scan.worker_threads)
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(usize::from)
+                        .unwrap_or(1)
+                }),
+            processes: cli.processes.or(file.scan.processes).unwrap_or(1),
             tcp_timeout: cli
                 .tcp_timeout
                 .or(file.scan.tcp_timeout_ms.map(Duration::from_millis))
@@ -285,6 +298,12 @@ impl Settings {
         }
         if settings.host_concurrency == 0 || settings.queue_depth == 0 {
             bail!("host-concurrency and queue-depth must be greater than zero");
+        }
+        if settings.worker_threads == 0 || settings.processes == 0 {
+            bail!("worker-threads and processes must be greater than zero");
+        }
+        if settings.processes > 64 {
+            bail!("processes must not exceed 64");
         }
         if settings.max_body == 0 {
             bail!("max-body must be greater than zero");

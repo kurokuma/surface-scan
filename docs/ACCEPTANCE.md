@@ -30,6 +30,7 @@
 | 仕様 | 実装 | 状態 |
 |---|---|---|
 | §11 bounded queue pipeline | `runtime::pipeline`。target/open-port/fingerprint/eventはbounded mpsc、各worker数も固定、unbounded不使用 | 高open比率100 portをqueue depth 2/probe concurrency 3で回帰試験済み |
+| multi-thread/process | 動的Tokio thread pool。targetを子processへ分割し、resource budgetを合計上限内で配分、親で出力再集約 | Windows 2 target × 2 processとresumeをend-to-end test済み |
 | §16 TLS metadata | 証明書検証は行わず観測結果を保持。TLS成立・非HTTPも`protocol: "tls"`で保持 | 回帰テスト済み |
 | §20 suspicion scoring | 全加点項目を実装。`[suspicion]`で重み変更可、`suspicion_reasons`で根拠を出力 | unit test済み |
 | §22 known C2 port | `IP:port` / `IP,port` / CSV列（`--known-service-field`）。`--ports`外でも必ず走査 | end-to-end test済み |

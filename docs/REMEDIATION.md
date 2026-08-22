@@ -175,11 +175,23 @@ Linux実機での確認は `tests/raw_syn_linux.rs`（`--ignored`、`CAP_NET_RAW
 cargo fmt --all -- --check   clean
 cargo check --all-targets --locked   clean (Windows / Linux container)
 cargo clippy --all-targets --locked -- -D warnings   clean
-cargo test --all-targets --locked     52 passed / 0 failed (Windows)
+cargo test --all-targets --locked     55 passed / 0 failed (Windows)
+docker ... cargo test --all-targets --locked   55 passed / 0 failed (Linux, raw SYN 3 ignored)
 docker ... cargo test --test raw_syn_linux --locked -- --ignored   3 passed / 0 failed
 python -m py_compile scripts/benchmark.py   clean
 ```
 
-Windows内訳: unit 36、`bounded_pipeline` 1、`high_port_detection` 4、`hardening` 5、`pipeline_outputs` 5、`interrupt_resume` 1。Linuxの`raw_syn_linux` 3件は`CAP_NET_RAW`付きDockerで実行した。
+Windows内訳: unit 38、`bounded_pipeline` 1、`high_port_detection` 4、`hardening` 5、`pipeline_outputs` 5、`interrupt_resume` 1、`multiprocess` 1。Linuxの`raw_syn_linux` 3件は`CAP_NET_RAW`付きDockerで実行した。
 
 未主張の項目は `docs/REVIEW.md` および `docs/ACCEPTANCE.md` の記載どおり、外部interface・packet loss条件を含むraw SYN性能（10k/50k pps）と70 IP × 65535の受入時間、および実console eventによるgraceful shutdownである。これらは専用labまたは対話consoleでの計測が必要で、本修正では達成を主張しない。
+
+## 9. Multi-thread / Multi-process高速化
+
+- `--worker-threads`でTokio multi-thread runtimeを動的構築（既定は論理CPU数）
+- `--processes`でdeduplicate済みtargetをround-robin shardし、同一実行fileの子processを並列起動
+- rate、burst、connect socket、protocol/fingerprint concurrency、thread予算を均等分割し、合計上限を維持
+- 全workerで共通`scan_id`/metadataを使用し、親processがhost順にJSONL/CSV/flat/URL/Nmapを再生成
+- process別checkpointとcoordinator stateを分離し、resume時も重複host/serviceを生成しない
+- 中断hostのcheckpoint byte位置を進めず、resume時に部分host行をrollback
+
+回帰試験はWindows上で2 target × 2 processを実際に起動し、初回走査とresumeの両方でhost JSONL 2行、CSV 1 header + 2 service、metrics `hosts_completed=2`を確認した。

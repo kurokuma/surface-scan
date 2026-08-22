@@ -60,6 +60,12 @@ pub struct Cli {
     /// Bounded pipeline queue depth per stage.
     #[arg(long = "queue-depth")]
     pub queue_depth: Option<usize>,
+    /// Total Tokio worker-thread budget (distributed across child processes).
+    #[arg(long = "worker-threads")]
+    pub worker_threads: Option<usize>,
+    /// Split targets across this many local worker processes.
+    #[arg(long)]
+    pub processes: Option<usize>,
     /// TCP timeout, e.g. 700ms or 1s.
     #[arg(long="tcp-timeout", value_parser=parse_duration)]
     pub tcp_timeout: Option<std::time::Duration>,
@@ -111,6 +117,9 @@ pub struct Cli {
     /// tracing filter, e.g. info or surface_scan=debug.
     #[arg(long, default_value = "info")]
     pub log_level: String,
+    /// Internal coordinator-to-worker manifest.
+    #[arg(long, hide = true)]
+    pub worker_manifest: Option<PathBuf>,
 }
 
 fn parse_duration(value: &str) -> Result<std::time::Duration, String> {

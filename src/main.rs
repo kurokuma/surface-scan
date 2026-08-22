@@ -1,29 +1,28 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use operator_surface_scanner::fingerprint::FingerprintEngine;
 use operator_surface_scanner::{
     cli::Cli,
     config::Settings,
-    model::{Metrics, MetricsDocument, SCHEMA_VERSION, ScanMetadata, Target},
-    output::{OutputWriters, write_metrics},
-    protocol::{ProbeContext, WebProbe},
-    runtime::{Checkpoint, pipeline::Pipeline, shutdown},
-    scanner,
+    model::{Metrics, SCHEMA_VERSION, ScanMetadata, Target},
+    runtime::{
+        execute_scan,
+        multiprocess::{coordinate, load_worker_manifest, run_worker},
+    },
     target::parse_targets,
     util::{now_rfc3339, scan_id, sha256_hex},
 };
-use std::{io::Read, sync::Arc, time::Instant};
-use tokio_util::sync::CancellationToken;
+use std::io::Read;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_new(&cli.log_level).context("invalid log level")?,
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    if let Some(path) = cli.worker_manifest.as_deref() {
+        let manifest = load_worker_manifest(path)?;
+        init_logging(&manifest.log_level)?;
+        let runtime = multi_thread_runtime(manifest.settings.worker_threads)?;
+        runtime.block_on(run_worker(manifest))?;
+        return Ok(());
+    }
+    init_logging(&cli.log_level)?;
     let settings = Settings::load(&cli)?;
     let target_text = read_target_text(&cli)?;
     let targets = parse_targets(&target_text, settings.known_service_field.as_deref())?;
@@ -32,33 +31,14 @@ async fn main() -> Result<()> {
     }
     validate_artifact_paths(&cli, &settings)?;
     let target_hash = target_set_hash(&targets);
-    let checkpoint_path = settings
-        .checkpoint
-        .as_deref()
-        .or(settings.resume.as_deref())
-        .map(Path::to_path_buf);
-    let checkpoint = if let Some(path) = settings.resume.as_deref() {
-        Checkpoint::load(path, &target_hash, &settings.ports_spec)?
-    } else {
-        Checkpoint::fresh(target_hash.clone(), settings.ports_spec.clone())
-    };
-    // Validate backend/capabilities before touching output files. In
-    // particular, a raw-socket initialization failure must not truncate an
-    // analyst's existing result path.
-    let backend = scanner::backend(&settings).await?;
-    let append = settings.resume.is_some();
-    let writers = OutputWriters::open_at(
-        &settings.output,
-        settings.flat_output.as_deref(),
-        settings.csv.as_deref(),
-        settings.export_nmap.as_deref(),
-        settings.export_urls.as_deref(),
-        append,
-        settings.resume.as_ref().map(|_| checkpoint.output_position),
-    )?;
-    let meta = build_metadata(&settings, &targets, &target_hash, backend.name());
+    let meta = build_metadata(
+        &settings,
+        &targets,
+        &target_hash,
+        settings.scan_mode.as_str(),
+    );
     tracing::info!(
-        backend = backend.name(),
+        backend = settings.scan_mode.as_str(),
         scan_id = %meta.scan_id,
         targets = targets.len(),
         ports = settings.ports.len(),
@@ -67,44 +47,51 @@ async fn main() -> Result<()> {
         host_concurrency = settings.host_concurrency,
         probe_concurrency = settings.probe_concurrency,
         fingerprint_concurrency = settings.fingerprint_concurrency,
+        worker_threads = settings.worker_threads,
+        processes = settings.processes,
         tls_verification = %meta.tls_verification,
         "scan starting"
     );
-
-    let cancel = CancellationToken::new();
-    shutdown::watch(cancel.clone());
-
-    let pipeline = Pipeline {
-        probe_ctx: ProbeContext::from_settings(&settings),
-        probe: Arc::new(WebProbe::new()),
-        fingerprint: Arc::new(FingerprintEngine::new(&settings.fingerprints)),
-        backend,
-        meta: meta.clone(),
-        cancel: cancel.clone(),
-        checkpoint_path,
-        settings: settings.clone(),
-    };
-    let total_started = Instant::now();
-    let mut metrics = pipeline.run(targets, checkpoint, writers).await?;
-    metrics.elapsed_ms = total_started.elapsed().as_millis() as u64;
-    metrics.tcp_probe_rate_avg = if metrics.tcp_discovery_wall_ms == 0 {
-        0.0
-    } else {
-        metrics.tcp_probes as f64 / (metrics.tcp_discovery_wall_ms as f64 / 1000.0)
-    };
-    if let Some(path) = settings.metrics_json.as_deref() {
-        write_metrics(
-            path,
-            &MetricsDocument {
-                schema_version: SCHEMA_VERSION.into(),
+    let metrics = if settings.processes > 1 {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build coordinator runtime")?
+            .block_on(coordinate(
+                settings,
+                targets,
+                target_hash,
                 meta,
-                completed_at: now_rfc3339(),
-                metrics: metrics.clone(),
-            },
-        )?;
-    }
+                cli.log_level,
+            ))?
+    } else {
+        multi_thread_runtime(settings.worker_threads)?.block_on(execute_scan(
+            settings,
+            targets,
+            target_hash,
+            meta,
+        ))?
+    };
     print_summary(&metrics);
     Ok(())
+}
+
+fn init_logging(filter: &str) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_new(filter).context("invalid log level")?,
+        )
+        .with_writer(std::io::stderr)
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("initialize logging: {error}"))
+}
+
+fn multi_thread_runtime(worker_threads: usize) -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .context("build multi-thread runtime")
 }
 
 use std::path::Path;
@@ -113,6 +100,9 @@ use std::path::Path;
 /// handles aimed at one path can silently truncate the target list or replace
 /// scan results with a checkpoint.
 fn validate_artifact_paths(cli: &Cli, settings: &Settings) -> Result<()> {
+    let automatic_state =
+        (settings.processes > 1 && settings.checkpoint.is_none() && settings.resume.is_none())
+            .then(|| std::path::PathBuf::from(format!("{}.mp.state", settings.output.display())));
     let mut paths: Vec<(&str, &Path)> = vec![("host JSONL", &settings.output)];
     for (label, path) in [
         ("flat JSONL", settings.flat_output.as_deref()),
@@ -122,6 +112,7 @@ fn validate_artifact_paths(cli: &Cli, settings: &Settings) -> Result<()> {
         ("metrics JSON", settings.metrics_json.as_deref()),
         ("checkpoint", settings.checkpoint.as_deref()),
         ("resume checkpoint", settings.resume.as_deref()),
+        ("automatic process state", automatic_state.as_deref()),
         ("config", cli.config.as_deref()),
     ] {
         if let Some(path) = path {
@@ -197,6 +188,8 @@ fn build_metadata(
         fingerprint_concurrency: settings.fingerprint_concurrency,
         host_concurrency: settings.host_concurrency,
         queue_depth: settings.queue_depth,
+        worker_threads: settings.worker_threads,
+        processes: settings.processes,
         tcp_timeout_ms: settings.tcp_timeout.as_millis() as u64,
         tcp_retries: settings.tcp_retries,
         tls_timeout_ms: settings.tls_timeout.as_millis() as u64,

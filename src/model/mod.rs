@@ -37,6 +37,10 @@ pub struct ScanMetadata {
     pub fingerprint_concurrency: usize,
     pub host_concurrency: usize,
     pub queue_depth: usize,
+    #[serde(default = "default_worker_threads")]
+    pub worker_threads: usize,
+    #[serde(default = "default_processes")]
+    pub processes: usize,
     pub tcp_timeout_ms: u64,
     pub tcp_retries: u32,
     pub tls_timeout_ms: u64,
@@ -50,6 +54,16 @@ pub struct ScanMetadata {
     pub tls_verification: String,
     pub resumed: bool,
     pub host_os: String,
+}
+
+fn default_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+}
+
+fn default_processes() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

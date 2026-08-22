@@ -402,11 +402,12 @@ fn persist_host(
 ) -> Result<()> {
     update_metrics(metrics, host);
     writers.write_host(host)?;
-    checkpoint.output_position = writers.flush()?;
+    let flushed_position = writers.flush()?;
     checkpoint
         .discovered_open_ports
         .insert(host.ip, host.services.iter().map(|s| s.port).collect());
     if host.scan.complete {
+        checkpoint.output_position = flushed_position;
         checkpoint.protocol_probe_completed.insert(host.ip);
         checkpoint.completed_hosts.insert(host.ip);
     } else {

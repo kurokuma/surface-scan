@@ -1,9 +1,21 @@
+pub mod multiprocess;
 pub mod pipeline;
 pub mod shutdown;
 
+use crate::{
+    config::Settings,
+    fingerprint::FingerprintEngine,
+    model::{Metrics, MetricsDocument, SCHEMA_VERSION, ScanMetadata, Target},
+    output::{OutputWriters, write_metrics},
+    protocol::{ProbeContext, WebProbe},
+    runtime::pipeline::Pipeline,
+    scanner,
+    util::now_rfc3339,
+};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, io::Write, net::Ipv4Addr, path::Path};
+use std::{collections::BTreeSet, io::Write, net::Ipv4Addr, path::Path, sync::Arc, time::Instant};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Checkpoint {
@@ -44,18 +56,83 @@ impl Checkpoint {
         Ok(cp)
     }
     pub fn save(&self, path: &Path) -> Result<()> {
-        let temporary = path.with_extension("state.tmp");
-        let mut file = std::fs::File::create(&temporary)
-            .with_context(|| format!("create checkpoint {}", temporary.display()))?;
-        file.write_all(&serde_json::to_vec_pretty(self)?)
-            .with_context(|| format!("write checkpoint {}", temporary.display()))?;
-        file.sync_all()
-            .with_context(|| format!("sync checkpoint {}", temporary.display()))?;
-        drop(file);
-        replace_file(&temporary, path)
-            .with_context(|| format!("commit checkpoint {}", path.display()))?;
-        Ok(())
+        atomic_write_json(path, self)
     }
+}
+
+pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let temporary = path.with_extension("state.tmp");
+    let mut file = std::fs::File::create(&temporary)
+        .with_context(|| format!("create temporary file {}", temporary.display()))?;
+    file.write_all(&serde_json::to_vec_pretty(value)?)
+        .with_context(|| format!("write temporary file {}", temporary.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync temporary file {}", temporary.display()))?;
+    drop(file);
+    replace_file(&temporary, path).with_context(|| format!("commit file {}", path.display()))?;
+    Ok(())
+}
+
+/// Execute one scan shard. Single-process scans and hidden child workers use
+/// this same path so timeout, checkpoint, and output behavior cannot diverge.
+pub async fn execute_scan(
+    settings: Settings,
+    targets: Vec<Target>,
+    target_hash: String,
+    meta: ScanMetadata,
+) -> Result<Metrics> {
+    let checkpoint_path = settings
+        .checkpoint
+        .as_deref()
+        .or(settings.resume.as_deref())
+        .map(Path::to_path_buf);
+    let checkpoint = if let Some(path) = settings.resume.as_deref() {
+        Checkpoint::load(path, &target_hash, &settings.ports_spec)?
+    } else {
+        Checkpoint::fresh(target_hash, settings.ports_spec.clone())
+    };
+    let backend = scanner::backend(&settings).await?;
+    let writers = OutputWriters::open_at(
+        &settings.output,
+        settings.flat_output.as_deref(),
+        settings.csv.as_deref(),
+        settings.export_nmap.as_deref(),
+        settings.export_urls.as_deref(),
+        settings.resume.is_some(),
+        settings.resume.as_ref().map(|_| checkpoint.output_position),
+    )?;
+    let cancel = CancellationToken::new();
+    shutdown::watch(cancel.clone());
+    let pipeline = Pipeline {
+        probe_ctx: ProbeContext::from_settings(&settings),
+        probe: Arc::new(WebProbe::new()),
+        fingerprint: Arc::new(FingerprintEngine::new(&settings.fingerprints)),
+        backend,
+        meta: meta.clone(),
+        cancel,
+        checkpoint_path,
+        settings: settings.clone(),
+    };
+    let total_started = Instant::now();
+    let mut metrics = pipeline.run(targets, checkpoint, writers).await?;
+    metrics.elapsed_ms = total_started.elapsed().as_millis() as u64;
+    metrics.tcp_probe_rate_avg = if metrics.tcp_discovery_wall_ms == 0 {
+        0.0
+    } else {
+        metrics.tcp_probes as f64 / (metrics.tcp_discovery_wall_ms as f64 / 1000.0)
+    };
+    if let Some(path) = settings.metrics_json.as_deref() {
+        write_metrics(
+            path,
+            &MetricsDocument {
+                schema_version: SCHEMA_VERSION.into(),
+                meta,
+                completed_at: now_rfc3339(),
+                metrics: metrics.clone(),
+            },
+        )?;
+    }
+    Ok(metrics)
 }
 
 #[cfg(not(windows))]

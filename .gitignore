@@ -25,3 +25,5 @@ interesting.txt
 .DS_Store
 Thumbs.db
 spec.md
+
+*.json

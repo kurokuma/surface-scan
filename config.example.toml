@@ -12,6 +12,10 @@ concurrency = 1024
 host_concurrency = 8
 # Bounded depth of each pipeline stage queue.
 queue_depth = 64
+# Total Tokio thread budget. With processes > 1 it is divided across workers.
+# worker_threads = 16
+# Split targets across local worker processes (1-64). Keep 1 for a single IP.
+processes = 1
 tcp_timeout_ms = 700
 tcp_retries = 1
 

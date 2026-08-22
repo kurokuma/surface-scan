@@ -89,6 +89,8 @@ async fn open_port_work_is_bounded_by_probe_concurrency() {
         fingerprint_concurrency: settings.fingerprint_concurrency,
         host_concurrency: settings.host_concurrency,
         queue_depth: settings.queue_depth,
+        worker_threads: settings.worker_threads,
+        processes: settings.processes,
         tcp_timeout_ms: 1,
         tcp_retries: 0,
         tls_timeout_ms: 1,

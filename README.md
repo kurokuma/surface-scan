@@ -8,6 +8,7 @@
 - TCP connect backend（Windows/Linux/macOS）
 - Linux raw SYN backend（SYN/ACK検証、RST追跡、重複抑制、timeout cleanup、retry、rate/burst、root/CAP_NET_RAW）
 - bounded queue pipeline（target生成／TCP discovery／protocol probe／fingerprint／出力を別ステージで並行実行）
+- 動的Tokio multi-thread runtimeと、target shard型multi-process coordinator
 - TLS優先・plain HTTP fallback。80/443等のポート番号による決め打ちなし
 - HTTP status/title/header/cookie名/body SHA-256/favicon SHA-256+mmh3/latency
 - TLS version/cipher/ALPN/証明書/SPKI/SAN/期間/self-signed/IP SAN一致。**証明書検証は行わず、観測結果のみ記録**
@@ -69,6 +70,10 @@ Get-Content .\targets.txt | surface-scan - -p 1-65535
 
 # Linux raw SYN
 sudo surface-scan -i targets.txt -p 1-65535 --scan-mode syn --rate 50000 --burst 5000
+
+# 16 threadを4 processへ配分して複数targetを並列走査
+surface-scan -i targets.txt -p 1-65535 --worker-threads 16 --processes 4 `
+  --checkpoint scan.mp.state -o result.jsonl
 ```
 
 主な調整値:
@@ -81,6 +86,8 @@ sudo surface-scan -i targets.txt -p 1-65535 --scan-mode syn --rate 50000 --burst
 --fingerprint-concurrency 32 fingerprint worker上限（プロセス全体）
 --host-concurrency 8      並行discovery host数（synの既定は1）
 --queue-depth 64          各pipeline stageのキュー深度
+--worker-threads N        Tokio worker thread総数（既定: 論理CPU数）
+--processes N             target shard process数（既定1、最大64）
 --tcp-timeout 700ms --tcp-retries 1
 --tls-timeout 1s
 --http-timeout 1s         1回のread無通信タイムアウト
@@ -91,6 +98,8 @@ sudo surface-scan -i targets.txt -p 1-65535 --scan-mode syn --rate 50000 --burst
 ```
 
 `--http-timeout` と `--http-body-timeout` は役割が違います。前者だけでは、タイムアウト未満の間隔でバイトを送り続けるサーバがprobeを無限に占有できてしまうため、後者でレスポンス全体を必ず打ち切ります。
+
+`--processes`は複数targetをround-robinで分割します。単一IPのport範囲は分割しないため、process数はtarget数以下にしてください。`--rate`、`--burst`、connect socket数、protocol/fingerprint concurrency、`--worker-threads`は各子processへ均等配分され、全process合計が指定予算を超えないようにします。従ってprocess数を増やしただけで送信rateが意図せず倍増することはありません。各予算値はprocess数以上が必要です。
 
 設定例は [`config.example.toml`](config.example.toml) を参照してください。CLI指定はTOMLより優先されます。
 
@@ -115,6 +124,8 @@ surface-scan -i targets.txt -p 1-65535 --resume scan.state
 
 Version 1のresume境界はhost単位です。target set hash、port指定、schema versionが一致しないcheckpointは拒否します。host JSONLはcheckpoint済みbyte位置へ戻し、CSV、service JSONL、URL/Nmap出力はそのhost JSONLから再生成するため、checkpoint更新直前に停止しても重複tailを残しません。入力、出力、metrics、checkpointに同じfile pathを指定した場合も起動前に拒否します。
 
+multi-process時は指定checkpointがcoordinator stateになり、同名の`.parts`ディレクトリにprocess別manifest、host JSONL、metrics、checkpointを保持します。`--checkpoint`を省略した場合は`<output>.mp.state`を自動使用します。中断後は同じtarget、port、process数と`--resume <coordinator-state>`を指定してください。完了後も再現・監査用のpartsは保持されます。
+
 Ctrl+C（WindowsではCtrl+Break、コンソール終了、ログオフ、UnixではSIGINT/SIGTERM）では新規投入を停止し、処理中の結果を回収してからflushとcheckpoint保存を行います。**走査を完走しなかったhostは`completed_hosts`に入らず、次回のresumeで再走査されます。** 部分結果自体は`scan.complete: false`付きで出力されるため、観測できた情報は失われません。2回目のシグナルで即時終了します。
 
 ## テスト
@@ -137,14 +148,19 @@ docker compose -f tests/fixtures/compose.yml down
 Nmap比較（サービスversion比較ではなくdiscovery recallと時間の比較）:
 
 ```bash
-python scripts/benchmark.py --scanner ./target/release/surface-scan --target 127.0.0.1 --ports 1-65535
+python scripts/benchmark.py --scanner ./target/release/surface-scan `
+  --target 192.0.2.10 --target 192.0.2.11 --ports 1-65535 `
+  --processes 2 --worker-threads 8
 ```
+
+`--target`は繰り返し指定できます。比較対象のNmapが利用可能なら、hostごとのopen port recallと差分もJSONへ記録します。process並列化の実効速度はtarget数、latency、OS/NICに依存するため、許可されたlabで同一条件の`--processes 1`と比較してください。
 
 `psutil` が利用可能ならCPU時間とpeak RSSも記録し、Nmapのopen-port集合に対するrecallと差分をJSONで出力します。未導入でも経過時間とport差分の比較は実行できます。
 
 ## 検証境界
 
 - Windows connect-mode: compile、unit/integration testで検証。遅延ドリップ、TLS非HTTP、非HTTP TCP、favicon catch-all、known C2 port、CSVヘッダ、中断時checkpointの各回帰テストを実測で通過
+- Windows multi-process: 2 target × 2 processの子process起動、budget分割、JSONL/CSV/metrics統合、coordinator resume非重複をend-to-endで検証
 - Linux raw SYN: Linux Docker + `CAP_NET_RAW`でSYN/ACK検出、closed判定、中断扱いの3件を実行済み。外部interfaceでのpacket loss/retry、10k/50k pps、70 IP × 65535の性能受け入れは環境依存で、専用labで別途確認が必要（**達成は未主張**）
 - TLS証明書検証は意図的に行いません。エラーはscanを停止させずmetadataとして保持します。`self_signed`はissuer/subject一致によるheuristicです
 - HTTP/2のみを話すエンドポイントはTLSメタデータまでを記録し、h2フレームは解析しません
