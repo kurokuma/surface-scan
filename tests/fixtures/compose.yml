@@ -1,0 +1,28 @@
+services:
+  http-high:
+    image: nginx:alpine
+    ports: ["31337:80"]
+  https-high:
+    image: nginx:alpine
+    ports: ["49152:443"]
+    volumes:
+      - ./nginx-tls.conf:/etc/nginx/nginx.conf:ro
+    command: ["/bin/sh", "-c", "apk add --no-cache openssl >/dev/null && openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost -keyout /tmp/key.pem -out /tmp/cert.pem && nginx -g 'daemon off;'"]
+  hfs-like:
+    image: nginx:alpine
+    ports: ["27331:80"]
+    volumes: ["./hfs:/usr/share/nginx/html:ro"]
+  directory-listing:
+    image: nginx:alpine
+    ports: ["28080:80"]
+    volumes:
+      - ./nginx-directory.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./listing:/usr/share/nginx/html:ro
+  login-panel:
+    image: nginx:alpine
+    ports: ["28443:80"]
+    volumes: ["./login:/usr/share/nginx/html:ro"]
+  non-http:
+    image: alpine/socat
+    ports: ["29000:29000"]
+    command: ["-v", "tcp-listen:29000,fork,reuseaddr", "system:echo SSH-2.0-fixture"]

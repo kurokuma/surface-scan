@@ -1,0 +1,23 @@
+[scan]
+mode = "connect"
+ports = "1-65535"
+rate = 10000
+burst = 1000
+concurrency = 1024
+tcp_timeout_ms = 700
+tcp_retries = 1
+
+[protocol]
+http_timeout_ms = 1000
+tls_timeout_ms = 1000
+max_body_bytes = 262144
+probe_concurrency = 128
+
+[output]
+jsonl = "result.jsonl"
+csv = "result.csv"
+flat_jsonl = "services.jsonl"
+export_nmap = "interesting.txt"
+export_urls = "urls.txt"
+metrics_json = "metrics.json"
+
