@@ -27,3 +27,5 @@ Thumbs.db
 spec.md
 
 *.json
+
+result/*
