@@ -1,6 +1,6 @@
 # Operator Surface Scanner
 
-被疑C2 IPの **open TCP portだけ** を対象に、ポート番号へ依存せずHTTP/HTTPSの管理画面、ファイル配布面、未知Web surfaceを発見するRust製スキャナです。Nmapを置き換えるサービス列挙器ではなく、Nmap/Nuclei/ブラウザへ渡す候補を高速に絞る用途に特化しています。
+被疑C2 IPの **open TCP portだけ** を対象に、ポート番号へ依存せずHTTP/HTTPSの管理画面、ファイル配布面、未知Web surfaceを発見するRust製スキャナです。
 
 ## 実装範囲
 
@@ -82,7 +82,7 @@ sudo surface-scan -i targets.txt -p 1-65535 --scan-mode syn --rate 50000 --burst
 
 設定例は [`config.example.toml`](config.example.toml) を参照してください。CLI指定はTOMLより優先されます。
 
-## 出力契約
+## 出力形式
 
 host JSONLは1行1host、`schema_version: "1"`です。同じIPの全serviceを`services`配列へ格納するため、C2 port、管理UI、file serverを関連付けたままS3へ保存し、AthenaのJSON処理で展開できます。`--flat-output`は1行1serviceです。秘密を保存しないため`Set-Cookie`はcookie名だけを出力し、値は`response_headers`にも残しません。本文そのものは保存せず、長さとSHA-256だけを保持します。
 
