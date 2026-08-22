@@ -14,6 +14,12 @@ build/
 *.jsonl
 *.state
 results/
+
+# default scan outputs
+result.csv
+metrics.json
+urls.txt
+interesting.txt
 .idea/
 .vscode/
 .DS_Store

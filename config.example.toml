@@ -1,17 +1,63 @@
+# CLI arguments always override this file.
+
 [scan]
 mode = "connect"
 ports = "1-65535"
+# Column name in a CSV target list holding the known C2 port.
+# known_service_field = "c2_port"
 rate = 10000
 burst = 1000
 concurrency = 1024
+# Hosts discovered in parallel. Defaults to 8 for connect, 1 for syn.
+host_concurrency = 8
+# Bounded depth of each pipeline stage queue.
+queue_depth = 64
 tcp_timeout_ms = 700
 tcp_retries = 1
 
 [protocol]
+http = true
+https = true
+# Inactivity timeout for one socket read.
 http_timeout_ms = 1000
+# Hard deadline for a complete response. Without this a peer that trickles
+# bytes can hold a probe open indefinitely.
+http_body_timeout_ms = 1500
 tls_timeout_ms = 1000
 max_body_bytes = 262144
 probe_concurrency = 128
+fingerprint_concurrency = 32
+
+# Individual fingerprint rules. Disabling one removes it from the engine.
+[fingerprint]
+hfs = true
+directory_listing = true
+login_panel = true
+admin_panel = true
+apache = true
+nginx = true
+iis = true
+python_simplehttpserver = true
+tomcat = true
+jetty = true
+nodejs = true
+go_http = true
+
+# Triage priority weights only. A score is never a maliciousness verdict, and a
+# high port on its own is not treated as evidence of anything.
+[suspicion]
+high_port = 2
+high_port_threshold = 10000
+uncommon_server = 2
+absent_server = 1
+directory_listing = 3
+hfs = 3
+login_panel = 2
+admin_panel = 2
+self_signed_certificate = 1
+expired_certificate = 1
+downloadable_artifacts = 2
+unknown_fingerprint = 2
 
 [output]
 jsonl = "result.jsonl"
@@ -20,4 +66,5 @@ flat_jsonl = "services.jsonl"
 export_nmap = "interesting.txt"
 export_urls = "urls.txt"
 metrics_json = "metrics.json"
-
+# Free-form label stamped into every record's meta block.
+# scan_label = "campaign-2026-08"

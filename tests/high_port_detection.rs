@@ -1,4 +1,9 @@
-use operator_surface_scanner::protocol::{ProbeContext, ProtocolProbe, WebProbe};
+use operator_surface_scanner::{
+    config::SuspicionWeights,
+    fingerprint::FingerprintEngine,
+    model::ServiceResult,
+    protocol::{ProbeContext, ProtocolProbe, WebProbe},
+};
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::{net::Ipv4Addr, sync::Arc, time::Duration};
@@ -11,9 +16,18 @@ use tokio_rustls::TlsAcceptor;
 fn context() -> ProbeContext {
     ProbeContext {
         http_timeout: Duration::from_secs(2),
+        http_body_timeout: Duration::from_secs(4),
         tls_timeout: Duration::from_secs(2),
+        http_enabled: true,
+        https_enabled: true,
         max_body: 262_144,
+        suspicion: SuspicionWeights::default(),
     }
+}
+
+fn enrich(mut service: ServiceResult, ctx: &ProbeContext) -> ServiceResult {
+    FingerprintEngine::default().enrich(&mut service, &ctx.suspicion);
+    service
 }
 
 async fn bind_preferred(port: u16) -> TcpListener {
@@ -33,23 +47,68 @@ async fn detects_http_on_high_port_and_hashes_favicon() {
             let mut req = [0u8; 1024];
             let n = socket.read(&mut req).await.unwrap();
             let favicon = String::from_utf8_lossy(&req[..n]).contains("/favicon.ico");
+            // A real ICO payload, so the icon check accepts it.
+            let icon: &[u8] = &[0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x10, 0x10];
             let body = if favicon {
-                b"ICON".as_slice()
+                icon
             } else {
                 b"<html><title>Index of /</title></html>".as_slice()
             };
             let response = format!(
-                "HTTP/1.0 200 OK\r\nServer: nginx\r\nContent-Length: {}\r\n\r\n",
+                "HTTP/1.0 200 OK
+Server: nginx
+Content-Type: {}
+Content-Length: {}
+
+",
+                if favicon { "image/x-icon" } else { "text/html" },
                 body.len()
             );
             socket.write_all(response.as_bytes()).await.unwrap();
             socket.write_all(body).await.unwrap();
         }
     });
-    let result = WebProbe::default().probe(addr, false, &context()).await;
+    let ctx = context();
+    let result = enrich(WebProbe::default().probe(addr, false, &ctx).await, &ctx);
     assert_eq!(result.protocol, "http");
     assert_eq!(result.classification.as_deref(), Some("directory_listing"));
-    assert!(result.favicon_hash.is_some());
+    assert!(result.favicon_hash.is_some(), "{result:#?}");
+    assert!(result.favicon_mmh3.is_some(), "{result:#?}");
+    assert_ne!(
+        result.favicon_hash, result.body_sha256,
+        "favicon hash must not be the index page hash"
+    );
+}
+
+/// A catch-all server that answers /favicon.ico with its index page must not
+/// contribute a favicon hash, or the pivot corpus fills with page hashes.
+#[tokio::test]
+async fn html_at_the_favicon_path_yields_no_favicon_hash() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = socket.read(&mut req).await;
+            let body = b"<html><title>Catch All</title></html>";
+            let header = format!(
+                "HTTP/1.0 200 OK
+Content-Type: text/html
+Content-Length: {}
+
+",
+                body.len()
+            );
+            let _ = socket.write_all(header.as_bytes()).await;
+            let _ = socket.write_all(body).await;
+        }
+    });
+    let ctx = context();
+    let result = enrich(WebProbe::default().probe(addr, false, &ctx).await, &ctx);
+    assert_eq!(result.protocol, "http");
+    assert!(result.favicon_hash.is_none(), "{result:#?}");
+    assert!(result.favicon_mmh3.is_none(), "{result:#?}");
 }
 
 #[tokio::test]
@@ -79,7 +138,8 @@ async fn detects_https_on_high_port_with_self_signed_metadata() {
             .unwrap();
         }
     });
-    let result = WebProbe::default().probe(addr, false, &context()).await;
+    let ctx = context();
+    let result = enrich(WebProbe::default().probe(addr, false, &ctx).await, &ctx);
     assert_eq!(result.protocol, "https", "{result:#?}");
     assert!(
         result

@@ -1,19 +1,18 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use futures::{StreamExt, stream::FuturesUnordered};
+use operator_surface_scanner::fingerprint::FingerprintEngine;
 use operator_surface_scanner::{
     cli::Cli,
     config::Settings,
-    model::{HostResult, Metrics, ScanSummary},
+    model::{Metrics, MetricsDocument, SCHEMA_VERSION, ScanMetadata, Target},
     output::{OutputWriters, write_metrics},
-    protocol::{ProbeContext, ProtocolProbe, WebProbe},
-    runtime::Checkpoint,
+    protocol::{ProbeContext, WebProbe},
+    runtime::{Checkpoint, pipeline::Pipeline, shutdown},
     scanner,
     target::parse_targets,
-    util::{now_rfc3339, sha256_hex},
+    util::{now_rfc3339, scan_id, sha256_hex},
 };
-use std::{io::Read, net::SocketAddr, sync::Arc, time::Instant};
-use tokio::sync::Semaphore;
+use std::{io::Read, sync::Arc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -27,161 +26,189 @@ async fn main() -> Result<()> {
         .init();
     let settings = Settings::load(&cli)?;
     let target_text = read_target_text(&cli)?;
-    let targets = parse_targets(&target_text)?;
+    let targets = parse_targets(&target_text, settings.known_service_field.as_deref())?;
     if targets.is_empty() {
         bail!("no targets supplied")
     }
-    let target_hash = sha256_hex(
-        targets
-            .iter()
-            .map(|t| format!("{}:{:?}\n", t.ip, t.known_c2_ports))
-            .collect::<String>(),
-    );
+    validate_artifact_paths(&cli, &settings)?;
+    let target_hash = target_set_hash(&targets);
     let checkpoint_path = settings
         .checkpoint
         .as_deref()
-        .or(settings.resume.as_deref());
-    let mut checkpoint = if let Some(path) = settings.resume.as_deref() {
+        .or(settings.resume.as_deref())
+        .map(Path::to_path_buf);
+    let checkpoint = if let Some(path) = settings.resume.as_deref() {
         Checkpoint::load(path, &target_hash, &settings.ports_spec)?
     } else {
-        Checkpoint::fresh(target_hash, settings.ports_spec.clone())
+        Checkpoint::fresh(target_hash.clone(), settings.ports_spec.clone())
     };
+    // Validate backend/capabilities before touching output files. In
+    // particular, a raw-socket initialization failure must not truncate an
+    // analyst's existing result path.
+    let backend = scanner::backend(&settings).await?;
     let append = settings.resume.is_some();
-    let mut writers = OutputWriters::open(
+    let writers = OutputWriters::open_at(
         &settings.output,
         settings.flat_output.as_deref(),
         settings.csv.as_deref(),
         settings.export_nmap.as_deref(),
         settings.export_urls.as_deref(),
         append,
+        settings.resume.as_ref().map(|_| checkpoint.output_position),
     )?;
-    let backend = scanner::backend(&settings).await?;
+    let meta = build_metadata(&settings, &targets, &target_hash, backend.name());
     tracing::info!(
         backend = backend.name(),
+        scan_id = %meta.scan_id,
         targets = targets.len(),
         ports = settings.ports.len(),
         rate = settings.rate,
         concurrency = settings.concurrency,
+        host_concurrency = settings.host_concurrency,
+        probe_concurrency = settings.probe_concurrency,
+        fingerprint_concurrency = settings.fingerprint_concurrency,
+        tls_verification = %meta.tls_verification,
         "scan starting"
     );
+
     let cancel = CancellationToken::new();
-    let signal_cancel = cancel.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::warn!("shutdown requested; stopping new probes");
-            signal_cancel.cancel();
-        }
-    });
-    let probe = Arc::new(WebProbe::default());
-    let probe_sem = Arc::new(Semaphore::new(settings.probe_concurrency));
-    let probe_ctx = ProbeContext {
-        http_timeout: settings.http_timeout,
-        tls_timeout: settings.tls_timeout,
-        max_body: settings.max_body,
+    shutdown::watch(cancel.clone());
+
+    let pipeline = Pipeline {
+        probe_ctx: ProbeContext::from_settings(&settings),
+        probe: Arc::new(WebProbe::new()),
+        fingerprint: Arc::new(FingerprintEngine::new(&settings.fingerprints)),
+        backend,
+        meta: meta.clone(),
+        cancel: cancel.clone(),
+        checkpoint_path,
+        settings: settings.clone(),
     };
     let total_started = Instant::now();
-    let mut metrics = Metrics {
-        targets: targets.len(),
-        ports_per_target: settings.ports.len(),
-        ..Default::default()
-    };
-    for target in targets {
-        if checkpoint.completed_hosts.contains(&target.ip) {
-            tracing::debug!(ip=%target.ip,"skipping completed host");
-            continue;
-        }
-        if cancel.is_cancelled() {
-            break;
-        }
-        let started_text = now_rfc3339();
-        let scan_started = Instant::now();
-        let open = backend
-            .discover(target.ip, &settings.ports, &cancel)
-            .await
-            .with_context(|| format!("scan {}", target.ip))?;
-        let discovery_ms = scan_started.elapsed().as_millis() as u64;
-        checkpoint
-            .discovered_open_ports
-            .insert(target.ip, open.clone());
-        if let Some(path) = checkpoint_path {
-            checkpoint.save(path)?
-        }
-        let protocol_started = Instant::now();
-        let mut pending = FuturesUnordered::new();
-        let mut next_port = 0usize;
-        let mut services = vec![];
-        while next_port < open.len() || !pending.is_empty() {
-            while next_port < open.len()
-                && pending.len() < settings.probe_concurrency
-                && !cancel.is_cancelled()
-            {
-                let port = open[next_port];
-                next_port += 1;
-                let permits = probe_sem.clone();
-                let probe = probe.clone();
-                let ctx = probe_ctx.clone();
-                let known = target.known_c2_ports.contains(&port);
-                let ip = target.ip;
-                pending.push(async move {
-                    let _permit = permits
-                        .acquire_owned()
-                        .await
-                        .expect("probe semaphore closed");
-                    probe.probe(SocketAddr::from((ip, port)), known, &ctx).await
-                });
-            }
-            if let Some(service) = pending.next().await {
-                services.push(service);
-            } else {
-                break;
-            }
-        }
-        services.sort_by_key(|s| s.port);
-        let combined_protocol_ms = protocol_started.elapsed().as_millis() as u64;
-        let fingerprint_ms = services
-            .iter()
-            .filter_map(|service| service.fingerprint_latency_ms)
-            .sum();
-        let protocol_ms = combined_protocol_ms.saturating_sub(fingerprint_ms);
-        let host = HostResult {
-            schema_version: "1".into(),
-            ip: target.ip,
-            started_at: started_text,
-            completed_at: now_rfc3339(),
-            scan: ScanSummary {
-                ports_scanned: settings.ports.len(),
-                open_ports: open.len(),
-                tcp_discovery_ms: discovery_ms,
-                protocol_detection_ms: protocol_ms,
-                fingerprint_ms,
-            },
-            services,
-        };
-        update_metrics(&mut metrics, &host);
-        writers.write_host(&host)?;
-        checkpoint.output_position = writers.flush()?;
-        checkpoint.protocol_probe_completed.insert(target.ip);
-        checkpoint.completed_hosts.insert(target.ip);
-        if let Some(path) = checkpoint_path {
-            checkpoint.save(path)?
-        }
-        tracing::info!(ip=%target.ip,open_ports=host.scan.open_ports,web_services=host.services.iter().filter(|s|matches!(s.protocol.as_str(),"http"|"https")).count(),"host complete");
-    }
+    let mut metrics = pipeline.run(targets, checkpoint, writers).await?;
     metrics.elapsed_ms = total_started.elapsed().as_millis() as u64;
-    metrics.tcp_probe_rate_avg = if metrics.elapsed_ms == 0 {
+    metrics.tcp_probe_rate_avg = if metrics.tcp_discovery_wall_ms == 0 {
         0.0
     } else {
-        metrics.tcp_probes as f64 / (metrics.elapsed_ms as f64 / 1000.0)
+        metrics.tcp_probes as f64 / (metrics.tcp_discovery_wall_ms as f64 / 1000.0)
     };
-    writers.flush()?;
-    if let Some(path) = checkpoint_path {
-        checkpoint.save(path)?
-    }
     if let Some(path) = settings.metrics_json.as_deref() {
-        write_metrics(path, &metrics)?
+        write_metrics(
+            path,
+            &MetricsDocument {
+                schema_version: SCHEMA_VERSION.into(),
+                meta,
+                completed_at: now_rfc3339(),
+                metrics: metrics.clone(),
+            },
+        )?;
     }
-    print_summary(&metrics, cancel.is_cancelled());
+    print_summary(&metrics);
     Ok(())
+}
+
+use std::path::Path;
+
+/// Refuse aliases between inputs, outputs, metrics, and state. Multiple file
+/// handles aimed at one path can silently truncate the target list or replace
+/// scan results with a checkpoint.
+fn validate_artifact_paths(cli: &Cli, settings: &Settings) -> Result<()> {
+    let mut paths: Vec<(&str, &Path)> = vec![("host JSONL", &settings.output)];
+    for (label, path) in [
+        ("flat JSONL", settings.flat_output.as_deref()),
+        ("CSV", settings.csv.as_deref()),
+        ("Nmap export", settings.export_nmap.as_deref()),
+        ("URL export", settings.export_urls.as_deref()),
+        ("metrics JSON", settings.metrics_json.as_deref()),
+        ("checkpoint", settings.checkpoint.as_deref()),
+        ("resume checkpoint", settings.resume.as_deref()),
+        ("config", cli.config.as_deref()),
+    ] {
+        if let Some(path) = path {
+            paths.push((label, path));
+        }
+    }
+    if let Some(input) = cli.input.as_deref().filter(|path| path.as_os_str() != "-") {
+        paths.push(("target input", input));
+    }
+
+    let mut seen = std::collections::HashMap::new();
+    for (label, path) in paths {
+        let absolute = normalized_path(path)?;
+        if let Some(previous) = seen.insert(absolute, label) {
+            let same_state = matches!(previous, "checkpoint" | "resume checkpoint")
+                && matches!(label, "checkpoint" | "resume checkpoint");
+            if !same_state {
+                bail!("{label} path aliases {previous}: {}", path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalized_path(path: &Path) -> Result<std::path::PathBuf> {
+    let absolute = std::path::absolute(path)
+        .with_context(|| format!("resolve artifact path {}", path.display()))?;
+    if absolute.exists() {
+        return std::fs::canonicalize(&absolute)
+            .with_context(|| format!("canonicalize artifact path {}", path.display()));
+    }
+    if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name())
+        && parent.exists()
+    {
+        return Ok(std::fs::canonicalize(parent)?.join(name));
+    }
+    Ok(absolute)
+}
+
+fn target_set_hash(targets: &[Target]) -> String {
+    sha256_hex(
+        targets
+            .iter()
+            .map(|t| format!("{}:{:?}\n", t.ip, t.known_c2_ports))
+            .collect::<String>(),
+    )
+}
+
+/// Provenance recorded on every output record so an archived result stays
+/// interpretable without the original command line.
+fn build_metadata(
+    settings: &Settings,
+    targets: &[Target],
+    target_hash: &str,
+    backend: &str,
+) -> ScanMetadata {
+    ScanMetadata {
+        tool: "operator-surface-scanner".into(),
+        tool_version: env!("CARGO_PKG_VERSION").into(),
+        schema_version: SCHEMA_VERSION.into(),
+        scan_id: scan_id(),
+        scan_label: settings.scan_label.clone(),
+        scan_started_at: now_rfc3339(),
+        scan_mode: backend.into(),
+        port_spec: settings.ports_spec.clone(),
+        port_count: settings.ports.len(),
+        target_count: targets.len(),
+        target_set_hash: target_hash.into(),
+        rate: settings.rate,
+        burst: settings.burst,
+        concurrency: settings.concurrency,
+        probe_concurrency: settings.probe_concurrency,
+        fingerprint_concurrency: settings.fingerprint_concurrency,
+        host_concurrency: settings.host_concurrency,
+        queue_depth: settings.queue_depth,
+        tcp_timeout_ms: settings.tcp_timeout.as_millis() as u64,
+        tcp_retries: settings.tcp_retries,
+        tls_timeout_ms: settings.tls_timeout.as_millis() as u64,
+        http_enabled: settings.http_enabled,
+        https_enabled: settings.https_enabled,
+        http_timeout_ms: settings.http_timeout.as_millis() as u64,
+        http_body_timeout_ms: settings.http_body_timeout.as_millis() as u64,
+        max_body_bytes: settings.max_body,
+        tls_verification: "skipped".into(),
+        resumed: settings.resume.is_some(),
+        host_os: std::env::consts::OS.into(),
+    }
 }
 
 fn read_target_text(cli: &Cli) -> Result<String> {
@@ -212,45 +239,26 @@ fn read_target_text(cli: &Cli) -> Result<String> {
     }
     Ok(text)
 }
-fn update_metrics(m: &mut Metrics, h: &HostResult) {
-    m.tcp_probes += h.scan.ports_scanned as u64;
-    m.tcp_discovery_ms += h.scan.tcp_discovery_ms;
-    m.protocol_detection_ms += h.scan.protocol_detection_ms;
-    m.fingerprint_ms += h.scan.fingerprint_ms;
-    m.open_ports += h.scan.open_ports as u64;
-    for s in &h.services {
-        match s.protocol.as_str() {
-            "http" => m.http_services += 1,
-            "https" => m.https_services += 1,
-            _ => {}
-        }
-        if s.fingerprints.iter().any(|f| f.name == "hfs") {
-            m.hfs += 1
-        }
-        match s.classification.as_deref() {
-            Some("directory_listing") => m.directory_listings += 1,
-            Some("login_panel" | "admin_panel") => m.login_admin_panels += 1,
-            _ => {}
-        }
-        if s.is_unknown_web {
-            m.unknown_web_surfaces += 1
-        }
-    }
-}
-fn print_summary(m: &Metrics, interrupted: bool) {
+
+fn print_summary(m: &Metrics) {
     eprintln!(
-        "\nScan summary{}\nTargets                 {}\nPorts per target        {}\nTCP probes              {}\nOpen ports              {}\nHTTP services           {}\nHTTPS services          {}\nHFS                     {}\nDirectory listings      {}\nLogin/Admin panels      {}\nUnknown web surfaces    {}\nTCP discovery           {:.2}s\nProtocol detection      {:.2}s\nFingerprint             {:.3}s\nElapsed                 {:.2}s\nTCP probe rate avg      {:.0} pps",
-        if interrupted { " (interrupted)" } else { "" },
+        "\nScan summary{}\nTargets                 {}\nPorts per target        {}\nHosts completed         {}\nHosts interrupted       {}\nTCP probes              {}\nOpen ports              {}\nHTTP services           {}\nHTTPS services          {}\nTLS (non-HTTP)          {}\nUnknown TCP             {}\nHFS                     {}\nDirectory listings      {}\nLogin/Admin panels      {}\nUnknown web surfaces    {}\nTCP discovery (wall)    {:.2}s\nTCP discovery (sum)     {:.2}s\nProtocol detection      {:.2}s\nFingerprint             {:.3}s\nElapsed                 {:.2}s\nTCP probe rate avg      {:.0} pps",
+        if m.interrupted { " (interrupted)" } else { "" },
         m.targets,
         m.ports_per_target,
+        m.hosts_completed,
+        m.hosts_interrupted,
         m.tcp_probes,
         m.open_ports,
         m.http_services,
         m.https_services,
+        m.tls_non_http_services,
+        m.unknown_tcp_services,
         m.hfs,
         m.directory_listings,
         m.login_admin_panels,
         m.unknown_web_surfaces,
+        m.tcp_discovery_wall_ms as f64 / 1000.0,
         m.tcp_discovery_ms as f64 / 1000.0,
         m.protocol_detection_ms as f64 / 1000.0,
         m.fingerprint_ms as f64 / 1000.0,

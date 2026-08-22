@@ -1,4 +1,4 @@
-use super::{ScannerBackend, TokenBucket};
+use super::{DiscoveryOutcome, Pacer, ScannerBackend};
 use crate::config::Settings;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -14,9 +14,12 @@ use pnet::{
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -28,9 +31,12 @@ pub struct RawSynScanner {
 }
 impl RawSynScanner {
     pub fn new(s: &Settings) -> Result<Self> {
-        if unsafe { libc::geteuid() } != 0 {
-            tracing::warn!("raw SYN generally requires root or CAP_NET_RAW");
-        }
+        // Capability/socket initialization is a fatal configuration error per
+        // spec section 30. Probe it before the pipeline starts so it cannot be
+        // mistaken for one recoverable target failure.
+        let protocol = TransportChannelType::Layer3(IpNextHeaderProtocols::Tcp);
+        let _ = transport_channel(4096, protocol)
+            .context("initialize raw IPv4/TCP channel (root or CAP_NET_RAW required)")?;
         Ok(Self {
             rate: s.rate,
             burst: s.burst,
@@ -40,9 +46,13 @@ impl RawSynScanner {
     }
 }
 
+/// One in-flight SYN awaiting a reply.
 #[derive(Clone, Copy)]
 struct Outstanding {
     seq: u32,
+    /// Wall clock after which the probe is abandoned, so the table cannot grow
+    /// without bound over a full 65535-port sweep.
+    expires_at: Instant,
 }
 
 #[async_trait]
@@ -55,7 +65,7 @@ impl ScannerBackend for RawSynScanner {
         target: Ipv4Addr,
         ports: &[u16],
         cancel: &CancellationToken,
-    ) -> Result<Vec<u16>> {
+    ) -> Result<DiscoveryOutcome> {
         let rate = self.rate;
         let burst = self.burst;
         let timeout = self.timeout;
@@ -77,17 +87,26 @@ fn run_raw(
     timeout: Duration,
     retries: u32,
     cancel: &CancellationToken,
-) -> Result<Vec<u16>> {
+) -> Result<DiscoveryOutcome> {
     let source = source_ip(target)?;
     let source_port = 49152u16.wrapping_add((std::process::id() % 16000) as u16);
     let protocol = TransportChannelType::Layer3(IpNextHeaderProtocols::Tcp);
     let (mut tx, mut rx) = transport_channel(65535, protocol)
         .context("initialize raw IPv4/TCP channel (root or CAP_NET_RAW required)")?;
     let outstanding = Arc::new(Mutex::new(HashMap::<u16, Outstanding>::new()));
-    let open = Arc::new(Mutex::new(HashMap::<u16, u32>::new()));
+    // Remote and local sequence numbers are both retained so the RST/ACK that
+    // closes a discovered half-open connection is valid in both directions.
+    let open = Arc::new(Mutex::new(HashMap::<u16, (u32, u32)>::new()));
+    let closed = Arc::new(Mutex::new(std::collections::HashSet::<u16>::new()));
+    // The receiver runs until the sender says it is done, rather than guessing
+    // from an empty table: at startup the table is legitimately empty.
+    let sending_done = Arc::new(AtomicBool::new(false));
+
     let receiver_out = outstanding.clone();
     let receiver_open = open.clone();
-    let receiver = thread::spawn(move || {
+    let receiver_closed = closed.clone();
+    let receiver_done = sending_done.clone();
+    let receiver = thread::spawn(move || -> std::io::Result<()> {
         let mut iter = ipv4_packet_iter(&mut rx);
         loop {
             match iter.next_with_timeout(Duration::from_millis(100)) {
@@ -95,86 +114,164 @@ fn run_raw(
                     if packet.get_source() != target || packet.get_destination() != source {
                         continue;
                     }
-                    if let Some(tcp) = TcpPacket::new(packet.payload()) {
-                        if tcp.get_destination() != source_port {
-                            continue;
+                    let Some(tcp) = TcpPacket::new(packet.payload()) else {
+                        continue;
+                    };
+                    if tcp.get_destination() != source_port {
+                        continue;
+                    }
+                    let flags = tcp.get_flags();
+                    let port = tcp.get_source();
+                    let expected = receiver_out
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&port).copied())
+                        .filter(|o| tcp.get_acknowledgement() == o.seq.wrapping_add(1));
+                    if expected.is_none() {
+                        // Unsolicited or already-answered: suppress duplicates.
+                        continue;
+                    }
+                    if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
+                        if let Ok(mut s) = receiver_open.lock() {
+                            s.insert(port, (tcp.get_sequence(), expected.unwrap().seq));
                         }
-                        let flags = tcp.get_flags();
-                        if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
-                            let port = tcp.get_source();
-                            let valid = receiver_out
-                                .lock()
-                                .ok()
-                                .and_then(|m| m.get(&port).copied())
-                                .is_some_and(|o| {
-                                    tcp.get_acknowledgement() == o.seq.wrapping_add(1)
-                                });
-                            if valid {
-                                if let Ok(mut s) = receiver_open.lock() {
-                                    s.insert(port, tcp.get_sequence());
-                                }
-                                if let Ok(mut m) = receiver_out.lock() {
-                                    m.remove(&port);
-                                }
-                            }
+                    } else if flags & TcpFlags::RST != 0 {
+                        if let Ok(mut s) = receiver_closed.lock() {
+                            s.insert(port);
                         }
+                    } else {
+                        continue;
+                    }
+                    if let Ok(mut m) = receiver_out.lock() {
+                        m.remove(&port);
                     }
                 }
                 Ok(None) => {
-                    if receiver_out.lock().map(|m| m.is_empty()).unwrap_or(true) {
+                    if receiver_done.load(Ordering::Relaxed) {
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(error) => {
+                    return Err(error);
+                }
             }
         }
+        Ok(())
     });
-    let runtime = tokio::runtime::Handle::current();
-    let limiter = TokenBucket::new(rate, burst);
-    for attempt in 0..=retries {
+
+    let mut pacer = Pacer::new(rate, burst);
+    let mut send_errors = 0u64;
+    let mut probes_sent = 0u64;
+    let mut sent_ports = std::collections::HashSet::<u16>::new();
+    let mut interrupted = false;
+    'attempts: for _attempt in 0..=retries {
         for &port in ports {
             if cancel.is_cancelled() {
+                interrupted = true;
                 break;
             }
-            if open.lock().map(|s| s.contains_key(&port)).unwrap_or(false) {
+            if open.lock().map(|s| s.contains_key(&port)).unwrap_or(false)
+                || closed.lock().map(|s| s.contains(&port)).unwrap_or(false)
+            {
                 continue;
             }
-            runtime.block_on(limiter.acquire());
-            let seq = sequence(target, port, attempt);
-            outstanding
-                .lock()
-                .unwrap()
-                .insert(port, Outstanding { seq });
+            pacer.tick();
+            // Stable per (host, port) across retries so a late reply to an
+            // earlier attempt still validates instead of being discarded.
+            let seq = sequence(target, port);
+            if let Ok(mut table) = outstanding.lock() {
+                if table.len() >= 4096 {
+                    let now = Instant::now();
+                    table.retain(|_, probe| probe.expires_at > now);
+                }
+                table.insert(
+                    port,
+                    Outstanding {
+                        seq,
+                        expires_at: Instant::now() + timeout,
+                    },
+                );
+            }
             let packet = make_packet(source, target, source_port, port, seq, 0, TcpFlags::SYN);
-            if let Err(error) = tx.send_to(Ipv4Packet::new(&packet).unwrap(), IpAddr::V4(target)) {
-                outstanding.lock().unwrap().remove(&port);
-                return Err(error.into());
+            match tx.send_to(Ipv4Packet::new(&packet).unwrap(), IpAddr::V4(target)) {
+                Ok(_) => {
+                    probes_sent += 1;
+                    sent_ports.insert(port);
+                }
+                Err(error) => {
+                    // A send failure is a per-probe event, not a scan failure:
+                    // ENOBUFS is routine at high packet rates (spec section 30).
+                    if let Ok(mut table) = outstanding.lock() {
+                        table.remove(&port);
+                    }
+                    send_errors += 1;
+                    if send_errors == 1 || send_errors.is_multiple_of(1000) {
+                        tracing::warn!(%error, port, count = send_errors, "raw SYN send failed");
+                    }
+                }
             }
         }
-        thread::sleep(timeout);
-        if cancel.is_cancelled() {
+        if interrupted {
+            break;
+        }
+        // Give the last packets of this round time to be answered.
+        let wait_until = Instant::now() + timeout;
+        while Instant::now() < wait_until {
+            if cancel.is_cancelled() {
+                interrupted = true;
+                break;
+            }
+            let remaining = wait_until.saturating_duration_since(Instant::now());
+            thread::sleep(Duration::from_millis(20).min(remaining));
+            let resolved = open.lock().map(|s| s.len()).unwrap_or(0)
+                + closed.lock().map(|s| s.len()).unwrap_or(0);
+            if resolved == ports.len() {
+                break 'attempts;
+            }
+        }
+        if interrupted {
             break;
         }
     }
-    outstanding.lock().unwrap().clear();
-    let _ = receiver.join();
-    let responses = open.lock().unwrap().clone();
-    for (&port, &remote_seq) in &responses {
+    sending_done.store(true, Ordering::Relaxed);
+    if let Ok(mut table) = outstanding.lock() {
+        table.clear();
+    }
+    receiver
+        .join()
+        .map_err(|_| anyhow::anyhow!("raw SYN receiver thread panicked"))??;
+
+    let responses = open.lock().map(|m| m.clone()).unwrap_or_default();
+    // Tear down the half-open connections we created.
+    for (&port, &(remote_seq, local_seq)) in &responses {
         let rst = make_packet(
             source,
             target,
             source_port,
             port,
-            0,
+            local_seq.wrapping_add(1),
             remote_seq.wrapping_add(1),
             TcpFlags::RST | TcpFlags::ACK,
         );
         let _ = tx.send_to(Ipv4Packet::new(&rst).unwrap(), IpAddr::V4(target));
     }
+    if send_errors > 0 {
+        tracing::warn!(
+            errors = send_errors,
+            "raw SYN probes dropped locally before transmission"
+        );
+    }
     let mut result: Vec<_> = responses.keys().copied().collect();
     result.sort_unstable();
-    Ok(result)
+    let all_ports_sent = sent_ports.len() == ports.len();
+    Ok(DiscoveryOutcome {
+        open: result,
+        attempted: sent_ports.len(),
+        probes_sent,
+        complete: !interrupted && all_ports_sent,
+    })
 }
+
 fn source_ip(target: Ipv4Addr) -> Result<Ipv4Addr> {
     let s = UdpSocket::bind("0.0.0.0:0")?;
     s.connect(SocketAddr::from((target, 9)))?;
@@ -183,9 +280,11 @@ fn source_ip(target: Ipv4Addr) -> Result<Ipv4Addr> {
         _ => bail!("IPv4 source route unavailable"),
     }
 }
-fn sequence(ip: Ipv4Addr, port: u16, attempt: u32) -> u32 {
-    u32::from(ip).rotate_left(7) ^ (port as u32).rotate_left(16) ^ attempt ^ 0x5a17_ace1
+
+fn sequence(ip: Ipv4Addr, port: u16) -> u32 {
+    u32::from(ip).rotate_left(7) ^ (port as u32).rotate_left(16) ^ 0x5a17_ace1
 }
+
 fn make_packet(
     src: Ipv4Addr,
     dst: Ipv4Addr,

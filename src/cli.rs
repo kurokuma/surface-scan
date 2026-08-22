@@ -8,6 +8,15 @@ pub enum ScanMode {
     Syn,
 }
 
+impl ScanMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScanMode::Connect => "connect",
+            ScanMode::Syn => "syn",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "surface-scan",
@@ -24,6 +33,9 @@ pub struct Cli {
     /// Ports such as '80,443,8000-9000' (default: 1-65535).
     #[arg(short = 'p', long = "ports")]
     pub ports: Option<String>,
+    /// CSV header column holding the known C2 port, e.g. c2_port.
+    #[arg(long = "known-service-field")]
+    pub known_service_field: Option<String>,
     /// TCP discovery backend.
     #[arg(long = "scan-mode", value_enum)]
     pub scan_mode: Option<ScanMode>,
@@ -33,12 +45,21 @@ pub struct Cli {
     /// Token bucket burst capacity.
     #[arg(long)]
     pub burst: Option<u64>,
-    /// Maximum connect sockets in flight.
+    /// Maximum connect sockets in flight across every host.
     #[arg(long)]
     pub concurrency: Option<usize>,
-    /// Maximum application probes in flight.
+    /// Maximum application probes in flight across every host.
     #[arg(long = "probe-concurrency")]
     pub probe_concurrency: Option<usize>,
+    /// Maximum fingerprint jobs in flight across every host.
+    #[arg(long = "fingerprint-concurrency")]
+    pub fingerprint_concurrency: Option<usize>,
+    /// Hosts discovered in parallel (default: 8 connect, 1 syn).
+    #[arg(long = "host-concurrency")]
+    pub host_concurrency: Option<usize>,
+    /// Bounded pipeline queue depth per stage.
+    #[arg(long = "queue-depth")]
+    pub queue_depth: Option<usize>,
     /// TCP timeout, e.g. 700ms or 1s.
     #[arg(long="tcp-timeout", value_parser=parse_duration)]
     pub tcp_timeout: Option<std::time::Duration>,
@@ -48,6 +69,9 @@ pub struct Cli {
     /// HTTP write/read inactivity timeout.
     #[arg(long="http-timeout", value_parser=parse_duration)]
     pub http_timeout: Option<std::time::Duration>,
+    /// Deadline for a complete HTTP response, e.g. 1500ms.
+    #[arg(long="http-body-timeout", value_parser=parse_duration)]
+    pub http_body_timeout: Option<std::time::Duration>,
     /// TLS connect/handshake timeout.
     #[arg(long="tls-timeout", value_parser=parse_duration)]
     pub tls_timeout: Option<std::time::Duration>,
@@ -78,6 +102,9 @@ pub struct Cli {
     /// Resume and append outputs using this state.
     #[arg(long)]
     pub resume: Option<PathBuf>,
+    /// Free-form label recorded in every output record.
+    #[arg(long = "scan-label")]
+    pub scan_label: Option<String>,
     /// TOML configuration file (CLI values take precedence).
     #[arg(long)]
     pub config: Option<PathBuf>,
