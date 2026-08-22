@@ -166,6 +166,42 @@ HTTPSでは証明書検証を行いません（`meta.tls_verification: "skipped"
 
 `suspicion_score`には`suspicion_reasons`が併記され、加点根拠を後から監査できます。重みは設定ファイルの`[suspicion]`で変更できます。
 
+## JSONLレポート生成
+
+長いhost JSONLは、標準ライブラリだけで動く`render_report.py`を使って、単体HTMLとMarkdownへ変換できます。
+
+```powershell
+python scripts/render_report.py result/valleyrat_susp_c2.jsonl `
+  --title "ValleyRAT Suspected C2 — Operator Surface Report"
+```
+
+既定の出力先:
+
+```text
+result/valleyrat_susp_c2.report.html
+result/valleyrat_susp_c2.report.md
+```
+
+出力先を変更する場合:
+
+```powershell
+python scripts/render_report.py scan.jsonl `
+  --html reports/scan.html --markdown reports/scan.md
+```
+
+HTMLレポートには以下を含みます。
+
+- host/open service/Web/TLS/高score件数のKPI
+- protocolとclassificationの分布chart
+- score 6以上の優先確認キュー
+- 同一body SHA-256とcertificate SHA-256の反復cluster
+- IP、port、title、Server、body/certificate hashを横断する検索
+- score、protocol、classification、Webのみ、未完了hostのfilter
+- hostごとのopen service一覧と、加点根拠、HTTP、TLS、hash、error詳細
+- desktop/mobile対応。外部CDN・外部通信なし
+
+入力値はHTML escapeされ、reportを開いただけで対象endpointへ接続しません。endpointはcopy buttonで取得できます。反復hashは有用なpivotですが、共有hostingや既定error pageでも一致するため、同一operator/campaignの証明として単独使用しないでください。
+
 ## Checkpoint / resume
 
 ```bash
@@ -184,6 +220,7 @@ Ctrl+C（WindowsではCtrl+Break、コンソール終了、ログオフ、Unix�
 ```powershell
 cargo fmt --all -- --check
 cargo test --all-targets
+python -m unittest tests/test_render_report.py -v
 ```
 
 統合テストはhigh-port HTTP（31337を優先）、high-port HTTPS（49152を優先）、自己署名証明書、favicon、directory/login classification、非HTTP TCPのnegative controlをローカルで起動します。固定portが使用中なら一時portへfallbackします。
