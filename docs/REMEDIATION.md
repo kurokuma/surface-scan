@@ -168,6 +168,7 @@ Linux実機での確認は `tests/raw_syn_linux.rs`（`--ignored`、`CAP_NET_RAW
 - target CSVを引用符対応parserで処理し、欠損列とport 0を拒否
 - raw SYNのRST/ACKに正しいlocal/remote sequenceを使用
 - discovery wall-clockを分離し、平均ppsの分母をscan全体時間から修正
+- TLS-only serviceにはHTTP Server/body/favicon由来のscoreを加算せず、TLS/port由来の根拠だけを適用
 
 ## 8. 検証結果
 
@@ -175,13 +176,13 @@ Linux実機での確認は `tests/raw_syn_linux.rs`（`--ignored`、`CAP_NET_RAW
 cargo fmt --all -- --check   clean
 cargo check --all-targets --locked   clean (Windows / Linux container)
 cargo clippy --all-targets --locked -- -D warnings   clean
-cargo test --all-targets --locked     55 passed / 0 failed (Windows)
-docker ... cargo test --all-targets --locked   55 passed / 0 failed (Linux, raw SYN 3 ignored)
+cargo test --all-targets --locked     56 passed / 0 failed (Windows)
+docker ... cargo test --all-targets --locked   56 passed / 0 failed (Linux, raw SYN 3 ignored)
 docker ... cargo test --test raw_syn_linux --locked -- --ignored   3 passed / 0 failed
 python -m py_compile scripts/benchmark.py   clean
 ```
 
-Windows内訳: unit 38、`bounded_pipeline` 1、`high_port_detection` 4、`hardening` 5、`pipeline_outputs` 5、`interrupt_resume` 1、`multiprocess` 1。Linuxの`raw_syn_linux` 3件は`CAP_NET_RAW`付きDockerで実行した。
+Windows内訳: unit 39、`bounded_pipeline` 1、`high_port_detection` 4、`hardening` 5、`pipeline_outputs` 5、`interrupt_resume` 1、`multiprocess` 1。Linuxの`raw_syn_linux` 3件は`CAP_NET_RAW`付きDockerで実行した。
 
 未主張の項目は `docs/REVIEW.md` および `docs/ACCEPTANCE.md` の記載どおり、外部interface・packet loss条件を含むraw SYN性能（10k/50k pps）と70 IP × 65535の受入時間、および実console eventによるgraceful shutdownである。これらは専用labまたは対話consoleでの計測が必要で、本修正では達成を主張しない。
 

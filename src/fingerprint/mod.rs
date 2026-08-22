@@ -335,12 +335,14 @@ pub fn suspicion_score(input: &SuspicionInput<'_>, w: &SuspicionWeights) -> (u32
             &mut reasons,
         );
     }
-    match input.server {
-        None => add(w.absent_server, "server header absent", &mut reasons),
-        Some(server) => {
-            let lower = server.to_ascii_lowercase();
-            if !COMMON_SERVERS.iter().any(|known| lower.contains(known)) {
-                add(w.uncommon_server, "uncommon server header", &mut reasons);
+    if input.is_web {
+        match input.server {
+            None => add(w.absent_server, "server header absent", &mut reasons),
+            Some(server) => {
+                let lower = server.to_ascii_lowercase();
+                if !COMMON_SERVERS.iter().any(|known| lower.contains(known)) {
+                    add(w.uncommon_server, "uncommon server header", &mut reasons);
+                }
             }
         }
     }
@@ -556,7 +558,8 @@ mod tests {
             },
             &SuspicionWeights::default(),
         );
-        assert_eq!(score, 2, "{reasons:?}");
+        assert_eq!(score, 1, "{reasons:?}");
+        assert!(!reasons.iter().any(|r| r.contains("server header")));
         assert!(!reasons.iter().any(|r| r.contains("unknown favicon")));
     }
 }

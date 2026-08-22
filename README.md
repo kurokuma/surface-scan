@@ -76,26 +76,77 @@ surface-scan -i targets.txt -p 1-65535 --worker-threads 16 --processes 4 `
   --checkpoint scan.mp.state -o result.jsonl
 ```
 
-主な調整値:
+## オプション詳細
 
-```text
---rate 10000              connection attempts/sec または SYN packets/sec（プロセス全体）
---burst 1000
---concurrency 1024        connect socket上限（プロセス全体）
---probe-concurrency 128   application probe上限（プロセス全体）
---fingerprint-concurrency 32 fingerprint worker上限（プロセス全体）
---host-concurrency 8      並行discovery host数（synの既定は1）
---queue-depth 64          各pipeline stageのキュー深度
---worker-threads N        Tokio worker thread総数（既定: 論理CPU数）
---processes N             target shard process数（既定1、最大64）
---tcp-timeout 700ms --tcp-retries 1
---tls-timeout 1s
---http-timeout 1s         1回のread無通信タイムアウト
---http-body-timeout 1500ms レスポンス全体の期限
---max-body 262144
---known-service-field c2_port   CSVのknown C2 port列名
---scan-label campaign-2026-08   出力metaへ刻むラベル
-```
+値を省略したときはTOML、TOMLにもなければ以下の既定値を使います。CLI指定は常にTOMLより優先されます。
+
+### scan modeの違い
+
+| 項目 | `--scan-mode connect` | `--scan-mode syn` |
+|---|---|---|
+| TCP discovery | OSの通常のTCP接続を最後まで確立 | raw socketでSYNを送信し、SYN/ACKまたはRST/ACKを直接判定 |
+| 対応OS | Windows / Linux / macOS | Linuxのみ。rootまたは`CAP_NET_RAW`が必要 |
+| 長所 | 権限不要で互換性が高く、ローカルfixtureや少数targetに向く | full-port・複数targetの高速discovery向け。接続を確立しないためsocket負荷を抑えやすい |
+| 主な制約 | 大量の同時接続でFD・ephemeral port・OS TCP stackを消費 | firewall、packet loss、interface routingの影響を受ける。権限不足なら出力を開く前に終了 |
+| `--rate` | 1秒あたりのconnection attempt数 | 1秒あたりの送信SYN packet数 |
+| `--concurrency` | 同時に進行できるTCP socket数 | raw SYN backendではdiscovery上限としては使用しない |
+| `--host-concurrency`既定 | 8 | 1。一つのraw senderで指定rateを使い切る設計 |
+| retry | timeoutしたTCP connectを再試行 | 応答のないSYNを再送 |
+
+どちらのmodeでも、application probeはTCP openと判定したportだけに対して「TLSを試し、成立しなければplain HTTP」を実行します。80/443などのport番号からprotocolを決め打ちしません。既定modeは`connect`です。
+
+### 入力・基本設定
+
+| オプション | 既定 | 説明 |
+|---|---:|---|
+| `TARGET` | なし | 単一IPv4、CIDR、`IP:known-port`を位置引数で指定。複数指定可能。`-`は標準入力 |
+| `-i, --input PATH` | なし | target fileを読む。位置引数と併用した場合は両方を統合し、重複IPをscan前に除去 |
+| `-p, --ports SPEC` | `1-65535` | `80,443,8000-9000`のように指定。重複portは除去。known C2 portは範囲外でも追加走査 |
+| `--known-service-field NAME` | 自動候補 | header付きCSVでknown C2 portを持つ列名を明示。例: `c2_port` |
+| `--config PATH` | なし | TOML設定を読む。未知keyや0 timeoutは誤設定として拒否 |
+| `--scan-label TEXT` | なし | campaign名などを全JSON/CSVのmetadataへ記録。scan動作には影響しない |
+| `--log-level FILTER` | `info` | tracing filter。例: `debug`、`surface_scan=debug`。大量scanで`trace`はI/O増加に注意 |
+
+### TCP discovery・速度調整
+
+| オプション | 既定 | 説明 |
+|---|---:|---|
+| `--scan-mode MODE` | `connect` | `connect`または`syn`。上表のbackendを選択 |
+| `--rate N` | 10000 | token bucketの平均速度。connectではattempt/sec、synではpacket/sec。multi-processでも全子process合計値 |
+| `--burst N` | 1000 | token bucketが瞬間的に許すattempt/SYN数。大きすぎる値は短時間の負荷集中を招く |
+| `--concurrency N` | 1024 | connect modeの全host合計in-flight socket上限。rateとは別の上限で、先に達した側が速度を制限 |
+| `--host-concurrency N` | connect: 8 / syn: 1 | TCP discoveryを同時進行するhost数。単一hostのport並列数ではない |
+| `--tcp-timeout DURATION` | `700ms` | 1回のTCP attempt/SYN応答待ち期限。`700ms`、`1s`、単位なしのmsを指定可能 |
+| `--tcp-retries N` | 1 | 初回失敗後の再試行回数。総試行上限は`1 + N`なので、probe数はport数を超える場合がある |
+
+`--rate`を上げても、connect modeでは`--concurrency`やOSのFD上限、syn modeではNIC・kernel・packet lossが先に上限になる場合があります。timeoutとretryを小さくすると速くなりますが、filtered/遅延portの見逃しが増えます。
+
+### protocol probe・pipeline
+
+| オプション | 既定 | 説明 |
+|---|---:|---|
+| `--probe-concurrency N` | 128 | open portに対するTLS/HTTP probeの全host合計並列数 |
+| `--fingerprint-concurrency N` | 32 | response metadata/body sampleを分類するworker数。ネットワーク接続数ではない |
+| `--queue-depth N` | 64 | bounded pipeline各stageの待ち行列長。小さい値はmemoryを抑え、大きい値はstage間の揺らぎを吸収 |
+| `--tls-timeout DURATION` | `1s` | TCP接続を含むTLS handshake期限。証明書検証は行わない |
+| `--http-timeout DURATION` | `1s` | HTTP write/readの1回あたり無通信期限 |
+| `--http-body-timeout DURATION` | `1500ms` | HTTP response全体のhard deadline。slow-drip responseもこの時間で打ち切る |
+| `--max-body BYTES` | 262144 | hashing/fingerprint用にmemoryへ保持するbody上限。body自体は出力しない |
+| `--worker-threads N` | 論理CPU数 | Tokio runtimeのthread総予算。multi-process時は子processへ分配 |
+| `--processes N` | 1 | targetをround-robin分割する子process数（最大64）。単一target内部のportはprocess分割しない |
+
+### 出力・再開
+
+| オプション | 既定 | 説明 |
+|---|---:|---|
+| `-o, --output PATH` | `result.jsonl` | 主出力。1行1hostのJSONL。拡張子が`.json`でも内容はJSONL形式 |
+| `--flat-output PATH` | なし | 1行1serviceのJSONL。Athena等でservice単位に扱う場合に使用 |
+| `--csv PATH` | なし | 1行1serviceの分析用CSV |
+| `--export-urls PATH` | なし | HTTP/HTTPS判定できたserviceをURLとして出力 |
+| `--export-nmap PATH` | なし | HTTP/HTTPS判定できたserviceを`IP:port`形式で出力 |
+| `--metrics-json PATH` | なし | 件数、stage時間、平均probe rate等をJSONで出力 |
+| `--checkpoint PATH` | なし | host完了ごとにresume stateをatomic更新。multi-process時はcoordinator stateになる |
+| `--resume PATH` | なし | checkpointから再開。target集合・port指定・schema・process数が一致しないstateは拒否 |
 
 `--http-timeout` と `--http-body-timeout` は役割が違います。前者だけでは、タイムアウト未満の間隔でバイトを送り続けるサーバがprobeを無限に占有できてしまうため、後者でレスポンス全体を必ず打ち切ります。
 
