@@ -408,6 +408,11 @@ struct ParsedResponse {
     elapsed_ms: u64,
 }
 
+/// Browser-like default for both the index request and favicon retrieval.
+/// Keep this centralized so every HTTP and HTTPS probe presents the same UA.
+const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
 /// Issue one `GET` and read the response.
 ///
 /// Two independent limits apply: `http_timeout` bounds a single idle read, and
@@ -422,7 +427,7 @@ async fn request_http<S: AsyncRead + AsyncWrite + Unpin>(
     let started = Instant::now();
     let deadline = started + ctx.http_body_timeout;
     let req = format!(
-        "GET {path} HTTP/1.0\r\nHost: {ip}\r\nUser-Agent: surface-scan/0.1\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.0\r\nHost: {ip}\r\nUser-Agent: {DEFAULT_USER_AGENT}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
     );
     timeout_at(
         deadline.min(Instant::now() + ctx.http_timeout),
@@ -671,5 +676,38 @@ mod tests {
             suspicion: SuspicionWeights::default(),
         };
         assert!(ctx.probe_budget() <= Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn requests_use_the_chrome_user_agent() {
+        let ctx = ProbeContext {
+            http_timeout: Duration::from_secs(1),
+            http_body_timeout: Duration::from_secs(1),
+            tls_timeout: Duration::from_secs(1),
+            http_enabled: true,
+            https_enabled: true,
+            max_body: 1024,
+            suspicion: SuspicionWeights::default(),
+        };
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let mut request = vec![0u8; 4096];
+            let size = server.read(&mut request).await.unwrap();
+            server
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(request[..size].to_vec()).unwrap()
+        });
+
+        request_http(&mut client, IpAddr::V4(Ipv4Addr::LOCALHOST), &ctx, "/")
+            .await
+            .unwrap();
+        let request = server_task.await.unwrap();
+        assert!(
+            request.contains(&format!("User-Agent: {DEFAULT_USER_AGENT}\r\n")),
+            "{request}"
+        );
+        assert!(request.contains("Chrome/"), "{request}");
     }
 }

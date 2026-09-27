@@ -95,6 +95,8 @@ surface-scan -i targets.txt -p 1-65535 --worker-threads 16 --processes 4 `
 
 どちらのmodeでも、application probeはTCP openと判定したportだけに対して「TLSを試し、成立しなければplain HTTP」を実行します。80/443などのport番号からprotocolを決め打ちしません。既定modeは`connect`です。
 
+HTTP/HTTPSとfaviconの取得では、既定でWindows版Chrome互換の`User-Agent`（`Chrome/131.0.0.0`）を送信します。`Accept-Encoding: identity`と`Connection: close`は従来どおり維持し、圧縮bombや接続保持によるresource占有を避けます。
+
 ### 入力・基本設定
 
 | オプション | 既定 | 説明 |
