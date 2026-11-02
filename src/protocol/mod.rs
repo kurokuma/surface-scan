@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use flate2::read::GzDecoder;
 use rustls::{
     DigitallySignedStruct, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -14,6 +15,7 @@ use scraper::{Html, Selector};
 use std::{
     collections::BTreeMap,
     fmt::Debug,
+    io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -328,7 +330,9 @@ impl WebProbe {
         tls: Option<TlsMetadata>,
         favicon: Option<(String, i32)>,
     ) -> ServiceResult {
-        let body_text = String::from_utf8_lossy(&r.body);
+        // Length and hash describe the received bytes; content analysis needs
+        // the page itself.
+        let body_text = String::from_utf8_lossy(r.decoded_body.as_deref().unwrap_or(&r.body));
         let title = extract_title(&body_text);
         let server = r.headers.get("server").cloned();
         ServiceResult {
@@ -404,6 +408,8 @@ struct ParsedResponse {
     headers: BTreeMap<String, String>,
     cookie_names: Vec<String>,
     body: Vec<u8>,
+    /// `body` without its transfer and content codings, when it had any.
+    decoded_body: Option<Vec<u8>>,
     redirect: Option<String>,
     elapsed_ms: u64,
 }
@@ -474,13 +480,7 @@ async fn request_http<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 fn parse_http(data: &[u8], max_body: usize) -> Result<ParsedResponse> {
-    let (split, body_offset) = if let Some(split) = data.windows(4).position(|w| w == b"\r\n\r\n") {
-        (split, split + 4)
-    } else if let Some(split) = data.windows(2).position(|w| w == b"\n\n") {
-        (split, split + 2)
-    } else {
-        return Err(anyhow!("not an HTTP response"));
-    };
+    let (split, body_offset) = header_end(data).ok_or_else(|| anyhow!("not an HTTP response"))?;
     let head = std::str::from_utf8(&data[..split]).context("non-UTF8 HTTP headers")?;
     let mut lines = head.lines();
     let status_line = lines
@@ -522,31 +522,118 @@ fn parse_http(data: &[u8], max_body: usize) -> Result<ParsedResponse> {
     }
     let body = data.get(body_offset..).unwrap_or_default();
     let body = body[..body.len().min(max_body)].to_vec();
+    let decoded_body = decode_body(&headers, &body, max_body);
     let redirect = headers.get("location").cloned();
     Ok(ParsedResponse {
         status,
         headers,
         cookie_names: cookies,
         body,
+        decoded_body,
         redirect,
         elapsed_ms: 0,
     })
 }
 
+/// Locate the first blank line, returning the end of the head and the start of
+/// the body. Whichever line ending appears first wins: searching for CRLF across
+/// the whole response would treat a CRLF blank line in the body of an LF-only
+/// response as the end of its headers.
+fn header_end(data: &[u8]) -> Option<(usize, usize)> {
+    data.iter().enumerate().find_map(|(index, byte)| {
+        if *byte != b'\n' {
+            return None;
+        }
+        let split = if index > 0 && data[index - 1] == b'\r' {
+            index - 1
+        } else {
+            index
+        };
+        match data.get(index + 1..) {
+            Some([b'\n', ..]) => Some((split, index + 2)),
+            Some([b'\r', b'\n', ..]) => Some((split, index + 3)),
+            _ => None,
+        }
+    })
+}
+
+/// Undo chunked framing and gzip so content analysis sees the page. A peer may
+/// send these despite `HTTP/1.0` and `Accept-Encoding: identity`. Responses are
+/// routinely cut short here, so partial output is kept, and output never exceeds
+/// `max_body` however far a compressed body would expand.
+fn decode_body(
+    headers: &BTreeMap<String, String>,
+    body: &[u8],
+    max_body: usize,
+) -> Option<Vec<u8>> {
+    let has_coding = |header: &str, coding: &str| {
+        headers
+            .get(header)
+            .is_some_and(|value| value.to_ascii_lowercase().contains(coding))
+    };
+    let dechunked = has_coding("transfer-encoding", "chunked")
+        .then(|| decode_chunked(body))
+        .flatten();
+    let gzipped = has_coding("content-encoding", "gzip") || has_coding("transfer-encoding", "gzip");
+    let gunzipped = gzipped
+        .then(|| decode_gzip(dechunked.as_deref().unwrap_or(body), max_body))
+        .flatten();
+    gunzipped.or(dechunked)
+}
+
+/// `None` when the body does not start with a chunk, i.e. the header lied.
+fn decode_chunked(body: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(body.len());
+    let mut rest = body;
+    let mut framed = false;
+    while let Some(line_end) = rest.iter().position(|byte| *byte == b'\n') {
+        let Some(size) = std::str::from_utf8(&rest[..line_end])
+            .ok()
+            .and_then(|line| line.split(';').next())
+            .and_then(|size| usize::from_str_radix(size.trim(), 16).ok())
+        else {
+            break;
+        };
+        framed = true;
+        if size == 0 {
+            break;
+        }
+        rest = &rest[line_end + 1..];
+        let take = size.min(rest.len());
+        decoded.extend_from_slice(&rest[..take]);
+        rest = &rest[take..];
+        rest = rest.strip_prefix(b"\r").unwrap_or(rest);
+        rest = rest.strip_prefix(b"\n").unwrap_or(rest);
+    }
+    framed.then_some(decoded)
+}
+
+/// `None` when nothing could be inflated, i.e. the header lied.
+fn decode_gzip(body: &[u8], max_body: usize) -> Option<Vec<u8>> {
+    let mut decoded = Vec::new();
+    // read_to_end keeps what was produced before an error from a truncated stream.
+    let _ = GzDecoder::new(body)
+        .take(max_body as u64)
+        .read_to_end(&mut decoded);
+    (!decoded.is_empty()).then_some(decoded)
+}
+
+/// The first non-empty HTML `<title>`. An SVG `<title>` only labels that graphic,
+/// so an empty document title must not be replaced by an icon's name.
 fn extract_title(body: &str) -> Option<String> {
     let doc = Html::parse_document(body);
     let selector = Selector::parse("title").ok()?;
     doc.select(&selector)
-        .next()
+        .filter(|n| &*n.value().name.ns == "http://www.w3.org/1999/xhtml")
         .map(|n| {
             n.text()
                 .collect::<String>()
                 .trim()
                 .chars()
                 .take(512)
-                .collect()
+                .collect::<String>()
         })
-        .filter(|s: &String| !s.is_empty())
+        .find(|s| !s.is_empty())
 }
 
 fn short_error(e: &anyhow::Error) -> String {
@@ -619,8 +706,148 @@ mod tests {
             headers,
             cookie_names: vec![],
             body: bytes.to_vec(),
+            decoded_body: None,
             redirect: None,
             elapsed_ms: 0,
+        }
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn response_with(head: &str, payload: &[u8]) -> Vec<u8> {
+        let mut data = format!("HTTP/1.1 200 OK\r\n{head}\r\n\r\n").into_bytes();
+        data.extend_from_slice(payload);
+        data
+    }
+
+    const PAGE: &[u8] = b"<html><head><title>Real Title</title></head></html>";
+
+    #[test]
+    fn a_crlf_blank_line_in_the_body_does_not_end_lf_only_headers() {
+        let mut data = b"HTTP/1.1 200 OK\nServer: fixture\n\n".to_vec();
+        data.extend_from_slice(PAGE);
+        data.extend_from_slice(b"\r\n\r\n<p>after</p>");
+        let response = parse_http(&data, 1024).unwrap();
+        assert_eq!(response.headers["server"], "fixture");
+        assert!(response.body.starts_with(PAGE));
+    }
+
+    #[test]
+    fn mixed_line_endings_still_find_the_blank_line() {
+        let response = parse_http(b"HTTP/1.1 200 OK\nServer: fixture\n\r\nbody", 100).unwrap();
+        assert_eq!(response.headers["server"], "fixture");
+        assert_eq!(response.body, b"body");
+    }
+
+    #[test]
+    fn chunks_split_inside_a_tag_are_reassembled() {
+        let mut payload = b"10;ext=1\r\n".to_vec();
+        payload.extend_from_slice(&PAGE[..16]);
+        payload.extend_from_slice(format!("\r\n{:x}\r\n", PAGE.len() - 16).as_bytes());
+        payload.extend_from_slice(&PAGE[16..]);
+        payload.extend_from_slice(b"\r\n0\r\n\r\n");
+        let data = response_with("Transfer-Encoding: chunked", &payload);
+        let response = parse_http(&data, 1024).unwrap();
+        assert_eq!(response.decoded_body.as_deref(), Some(PAGE));
+    }
+
+    #[test]
+    fn a_truncated_chunk_keeps_what_arrived() {
+        let data = response_with("Transfer-Encoding: chunked", b"ff\r\n<title>Cut</title>");
+        let response = parse_http(&data, 1024).unwrap();
+        assert_eq!(
+            response.decoded_body.as_deref(),
+            Some(&b"<title>Cut</title>"[..])
+        );
+    }
+
+    #[test]
+    fn a_false_coding_header_falls_back_to_the_raw_body() {
+        for head in ["Transfer-Encoding: chunked", "Content-Encoding: gzip"] {
+            let response = parse_http(&response_with(head, PAGE), 1024).unwrap();
+            assert_eq!(response.decoded_body, None, "{head}");
+        }
+    }
+
+    #[test]
+    fn gzip_is_inflated_even_when_also_chunked() {
+        let compressed = gzip(PAGE);
+        let plain = response_with("Content-Encoding: gzip", &compressed);
+        assert_eq!(
+            parse_http(&plain, 1024).unwrap().decoded_body.as_deref(),
+            Some(PAGE)
+        );
+
+        let mut chunked = format!("{:x}\r\n", compressed.len()).into_bytes();
+        chunked.extend_from_slice(&compressed);
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+        let both = response_with(
+            "Transfer-Encoding: chunked\r\nContent-Encoding: gzip",
+            &chunked,
+        );
+        assert_eq!(
+            parse_http(&both, 1024).unwrap().decoded_body.as_deref(),
+            Some(PAGE)
+        );
+    }
+
+    #[test]
+    fn inflated_output_is_bounded_by_max_body() {
+        let compressed = gzip(&vec![b'a'; 1_000_000]);
+        let data = response_with("Content-Encoding: gzip", &compressed);
+        let response = parse_http(&data, 4096).unwrap();
+        assert_eq!(response.decoded_body.unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn a_truncated_gzip_stream_keeps_what_inflated() {
+        let page: String = (0..2000).map(|n| format!("<p>{n}</p>")).collect();
+        let page = format!("<title>Partial</title>{page}");
+        let compressed = gzip(page.as_bytes());
+        let cut = &compressed[..compressed.len() / 2];
+        let response = parse_http(&response_with("Content-Encoding: gzip", cut), 65_536).unwrap();
+        let decoded = response.decoded_body.unwrap();
+        assert!(decoded.starts_with(b"<title>Partial</title>"));
+    }
+
+    #[test]
+    fn hashes_describe_received_bytes_while_analysis_sees_the_page() {
+        let compressed = gzip(PAGE);
+        let data = response_with("Content-Encoding: gzip", &compressed);
+        let response = parse_http(&data, 1024).unwrap();
+        let service = WebProbe::default().to_service(80, false, "http", response, None, None);
+        assert_eq!(service.title.as_deref(), Some("Real Title"));
+        assert_eq!(service.body_length, Some(compressed.len()));
+        assert_eq!(service.body_sha256, Some(sha256_hex(&compressed)));
+        assert_eq!(
+            service.fingerprint_body.as_deref().map(str::as_bytes),
+            Some(PAGE)
+        );
+    }
+
+    #[test]
+    fn the_first_non_empty_html_title_is_used() {
+        for (html, expected) in [
+            ("<title>Real</title>", Some("Real")),
+            ("<title></title><body><title>Second</title>", Some("Second")),
+            (
+                "<title>  \n </title><body><title>Second</title>",
+                Some("Second"),
+            ),
+            (
+                "<svg><title></title></svg><title>Later</title>",
+                Some("Later"),
+            ),
+            ("<title></title>", None),
+            // An icon's label is not the page's title.
+            ("<title></title><body><svg><title>Close</title></svg>", None),
+        ] {
+            assert_eq!(extract_title(html).as_deref(), expected, "{html}");
         }
     }
 
