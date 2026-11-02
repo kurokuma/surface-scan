@@ -122,3 +122,32 @@ async fn two_processes_merge_outputs_and_resume_without_duplicates() {
     let resumed_metrics: Value = serde_json::from_slice(&std::fs::read(&metrics).unwrap()).unwrap();
     assert_eq!(resumed_metrics["metrics"]["hosts_completed"], 2);
 }
+
+/// Workers keep every host in their parts so the coordinator can still count
+/// hosts that --open-only removes from the merged output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_only_filters_the_merged_output_but_not_completion_state() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    drop(listener);
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("hosts.jsonl");
+    let csv = dir.path().join("services.csv");
+    let metrics = dir.path().join("metrics.json");
+    let checkpoint = dir.path().join("multi.state");
+
+    let mut args = common_args(&port, &output, &csv, &metrics);
+    args.extend(["--checkpoint", path(&checkpoint), "127.0.0.1", "127.0.0.2"]);
+    let status = Command::new(env!("CARGO_BIN_EXE_surface-scan"))
+        .args(&args)
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success());
+
+    assert!(std::fs::read(&output).unwrap().is_empty());
+    let document: Value = serde_json::from_slice(&std::fs::read(&metrics).unwrap()).unwrap();
+    assert_eq!(document["metrics"]["hosts_completed"], 2);
+    let state: Value = serde_json::from_slice(&std::fs::read(&checkpoint).unwrap()).unwrap();
+    assert_eq!(state["complete"], true);
+}

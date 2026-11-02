@@ -1,5 +1,6 @@
 use crate::{
     cli::{Cli, ScanMode},
+    model::HostResult,
     target::parse_ports,
 };
 use anyhow::{Context, Result, bail};
@@ -120,6 +121,7 @@ pub struct Settings {
     pub https_enabled: bool,
     pub max_body: usize,
     pub output: PathBuf,
+    pub open_only: bool,
     pub csv: Option<PathBuf>,
     pub flat_output: Option<PathBuf>,
     pub export_nmap: Option<PathBuf>,
@@ -178,6 +180,7 @@ pub struct ProtocolConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct OutputConfig {
     pub jsonl: Option<PathBuf>,
+    pub open_only: Option<bool>,
     pub csv: Option<PathBuf>,
     pub flat_jsonl: Option<PathBuf>,
     pub export_nmap: Option<PathBuf>,
@@ -276,6 +279,7 @@ impl Settings {
                 .clone()
                 .or(file.output.jsonl)
                 .unwrap_or_else(|| "result.jsonl".into()),
+            open_only: cli.open_only.or(file.output.open_only).unwrap_or(true),
             csv: cli.csv.clone().or(file.output.csv),
             flat_output: cli.flat_output.clone().or(file.output.flat_jsonl),
             export_nmap: cli.export_nmap.clone().or(file.output.export_nmap),
@@ -325,6 +329,12 @@ impl Settings {
         }
         Ok(settings)
     }
+
+    /// Whether a finished host belongs in the host JSONL. Only the output is
+    /// filtered; metrics and the checkpoint still account for every host.
+    pub fn keeps_host(&self, host: &HostResult) -> bool {
+        !self.open_only || host.scan.open_ports > 0
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +362,29 @@ mod tests {
         let settings = Settings::load(&cli).unwrap();
         assert!(!settings.http_enabled);
         assert!(settings.https_enabled);
+    }
+
+    #[test]
+    fn open_only_defaults_on_and_cli_overrides_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scan.toml");
+        std::fs::write(&path, "[output]\nopen_only = false\n").unwrap();
+        let config = path.to_str().unwrap();
+        let load = |args: &[&str]| {
+            let cli = Cli::parse_from(
+                ["surface-scan"]
+                    .iter()
+                    .chain(args)
+                    .chain(&["127.0.0.1"])
+                    .copied(),
+            );
+            Settings::load(&cli).unwrap().open_only
+        };
+        assert!(load(&[]));
+        assert!(load(&["--open-only"]));
+        assert!(!load(&["--open-only=false"]));
+        assert!(!load(&["--config", config]));
+        assert!(load(&["--config", config, "--open-only"]));
     }
 
     #[test]

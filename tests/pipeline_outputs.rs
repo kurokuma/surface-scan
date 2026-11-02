@@ -201,6 +201,56 @@ async fn cli_scans_open_only_and_writes_all_output_shapes() {
     assert_eq!(std::fs::read_to_string(&nmap).unwrap().lines().count(), 1);
 }
 
+/// A port that was just released is refused, giving a host with nothing open.
+async fn closed_port() -> u16 {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+#[tokio::test]
+async fn hosts_without_open_ports_are_omitted_unless_requested() {
+    let port = closed_port().await.to_string();
+    let dir = tempdir().unwrap();
+    let jsonl = dir.path().join("hosts.jsonl");
+    let metrics = dir.path().join("metrics.json");
+    let checkpoint = dir.path().join("scan.state");
+    for (flags, expected_lines) in [(&[][..], 0), (&["--open-only=false"][..], 1)] {
+        let status = Command::new(env!("CARGO_BIN_EXE_surface-scan"))
+            .args(flags)
+            .args([
+                "--scan-mode",
+                "connect",
+                "--tcp-timeout",
+                "200ms",
+                "--tcp-retries",
+                "0",
+                "-p",
+                &port,
+                "-o",
+                path(&jsonl),
+                "--metrics-json",
+                path(&metrics),
+                "--checkpoint",
+                path(&checkpoint),
+                "127.0.0.1",
+            ])
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        let text = std::fs::read_to_string(&jsonl).unwrap();
+        assert_eq!(text.lines().count(), expected_lines, "{flags:?}:\n{text}");
+
+        // Omitted from the output, but the scan still accounts for the host.
+        let document: Value =
+            serde_json::from_str(&std::fs::read_to_string(&metrics).unwrap()).unwrap();
+        assert_eq!(document["metrics"]["hosts_completed"], 1);
+        let state: Value =
+            serde_json::from_str(&std::fs::read_to_string(&checkpoint).unwrap()).unwrap();
+        assert_eq!(state["completed_hosts"][0], "127.0.0.1");
+    }
+}
+
 /// Review 2.4: a fresh run truncates the CSV, so it must rewrite the header.
 #[tokio::test]
 async fn rerunning_over_an_existing_csv_keeps_a_header() {

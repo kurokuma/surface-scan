@@ -65,6 +65,8 @@ unknown_fingerprint = 2
 
 [output]
 jsonl = "result.jsonl"
+# Omit hosts without open ports from the host JSONL.
+open_only = true
 csv = "result.csv"
 flat_jsonl = "services.jsonl"
 export_nmap = "interesting.txt"

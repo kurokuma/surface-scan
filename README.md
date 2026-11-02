@@ -142,6 +142,7 @@ HTTP/HTTPSとfaviconの取得では、既定でWindows版Chrome互換の`User-Ag
 | オプション | 既定 | 説明 |
 |---|---:|---|
 | `-o, --output PATH` | `result.jsonl` | 主出力。1行1hostのJSONL。拡張子が`.json`でも内容はJSONL形式 |
+| `--open-only[=BOOL]` | `true` | open portが1個以上のhostだけを主出力へ書く。`--open-only=false`で0個のhostも出力。TOMLでは`[output] open_only` |
 | `--flat-output PATH` | なし | 1行1serviceのJSONL。Athena等でservice単位に扱う場合に使用 |
 | `--csv PATH` | なし | 1行1serviceの分析用CSV |
 | `--export-urls PATH` | なし | HTTP/HTTPS判定できたserviceをURLとして出力 |
@@ -149,6 +150,8 @@ HTTP/HTTPSとfaviconの取得では、既定でWindows版Chrome互換の`User-Ag
 | `--metrics-json PATH` | なし | 件数、stage時間、平均probe rate等をJSONで出力 |
 | `--checkpoint PATH` | なし | host完了ごとにresume stateをatomic更新。multi-process時はcoordinator stateになる |
 | `--resume PATH` | なし | checkpointから再開。target集合・port指定・schema・process数が一致しないstateは拒否 |
+
+`--open-only`で除外されるのはhost JSONLのレコードだけです。除外されたhostもmetricsとcheckpointには計上され、完走していればresume時に再走査されません。走査を完走できなかったhostやdiscoveryに失敗したhostも、open portが0個なら主出力には現れないため、件数は`--metrics-json`の`hosts_interrupted`とログで確認してください。すべてのhostが除外されると主出力は空になり、`render_report.py`は`no host records found`エラーになります。
 
 `--http-timeout` と `--http-body-timeout` は役割が違います。前者だけでは、タイムアウト未満の間隔でバイトを送り続けるサーバがprobeを無限に占有できてしまうため、後者でレスポンス全体を必ず打ち切ります。
 
@@ -215,7 +218,7 @@ Version 1のresume境界はhost単位です。target set hash、port指定、sch
 
 multi-process時は指定checkpointがcoordinator stateになり、同名の`.parts`ディレクトリにprocess別manifest、host JSONL、metrics、checkpointを保持します。`--checkpoint`を省略した場合は`<output>.mp.state`を自動使用します。中断後は同じtarget、port、process数と`--resume <coordinator-state>`を指定してください。完了後も再現・監査用のpartsは保持されます。
 
-Ctrl+C（WindowsではCtrl+Break、コンソール終了、ログオフ、UnixではSIGINT/SIGTERM）では新規投入を停止し、処理中の結果を回収してからflushとcheckpoint保存を行います。**走査を完走しなかったhostは`completed_hosts`に入らず、次回のresumeで再走査されます。** 部分結果自体は`scan.complete: false`付きで出力されるため、観測できた情報は失われません。2回目のシグナルで即時終了します。
+Ctrl+C（WindowsではCtrl+Break、コンソール終了、ログオフ、UnixではSIGINT/SIGTERM）では新規投入を停止し、処理中の結果を回収してからflushとcheckpoint保存を行います。**走査を完走しなかったhostは`completed_hosts`に入らず、次回のresumeで再走査されます。** open portを観測済みの部分結果は`scan.complete: false`付きで出力されるため、観測できた情報は失われません（open portが0個の部分結果は、`--open-only=false`の場合のみ出力されます）。2回目のシグナルで即時終了します。
 
 ## テスト
 

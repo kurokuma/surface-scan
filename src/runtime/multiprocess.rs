@@ -261,6 +261,9 @@ fn shard_settings(base: &Settings, directory: &Path, index: usize, count: usize)
     child.fingerprint_concurrency = share(base.fingerprint_concurrency, count, index);
     child.host_concurrency = share(base.host_concurrency.max(count), count, index);
     child.output = directory.join(format!("part-{index}.hosts.jsonl"));
+    // The coordinator rebuilds metrics and completion state from these parts,
+    // so every host stays here and --open-only applies to the merged output.
+    child.open_only = false;
     child.flat_output = None;
     child.csv = None;
     child.export_nmap = None;
@@ -379,7 +382,9 @@ fn write_merged_outputs<'a>(
         false,
     )?;
     for host in hosts {
-        writers.write_host(host)?;
+        if settings.keeps_host(host) {
+            writers.write_host(host)?;
+        }
     }
     writers.flush()?;
     Ok(())

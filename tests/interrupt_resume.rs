@@ -86,13 +86,12 @@ fn metadata(settings: &Settings) -> ScanMetadata {
     }
 }
 
-#[tokio::test]
-async fn an_interrupted_host_is_not_checkpointed_as_completed() {
-    let dir = tempdir().unwrap();
-    let jsonl = dir.path().join("hosts.jsonl");
-    let state = dir.path().join("scan.state");
-    let settings = settings();
-    let writers = OutputWriters::open(&jsonl, None, None, None, None, false).unwrap();
+async fn run_interrupted(
+    settings: Settings,
+    jsonl: &std::path::Path,
+    state: &std::path::Path,
+) -> operator_surface_scanner::model::Metrics {
+    let writers = OutputWriters::open(jsonl, None, None, None, None, false).unwrap();
     let pipeline = Pipeline {
         probe_ctx: ProbeContext::from_settings(&settings),
         probe: Arc::new(WebProbe::default()),
@@ -100,7 +99,7 @@ async fn an_interrupted_host_is_not_checkpointed_as_completed() {
         backend: Arc::new(InterruptedBackend),
         meta: metadata(&settings),
         cancel: CancellationToken::new(),
-        checkpoint_path: Some(state.clone()),
+        checkpoint_path: Some(state.to_path_buf()),
         settings: settings.clone(),
     };
     let target = Target {
@@ -108,10 +107,20 @@ async fn an_interrupted_host_is_not_checkpointed_as_completed() {
         known_c2_ports: vec![],
     };
     let checkpoint = Checkpoint::fresh("hash".into(), settings.ports_spec.clone());
-    let metrics = pipeline
+    pipeline
         .run(vec![target], checkpoint, writers)
         .await
-        .unwrap();
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_interrupted_host_is_not_checkpointed_as_completed() {
+    let dir = tempdir().unwrap();
+    let jsonl = dir.path().join("hosts.jsonl");
+    let state = dir.path().join("scan.state");
+    let mut settings = settings();
+    settings.open_only = false;
+    let metrics = run_interrupted(settings, &jsonl, &state).await;
 
     assert_eq!(metrics.hosts_interrupted, 1);
     assert_eq!(metrics.hosts_completed, 0);
@@ -147,4 +156,19 @@ async fn an_interrupted_host_is_not_checkpointed_as_completed() {
     resumed.flush().unwrap();
     drop(resumed);
     assert!(std::fs::read(&jsonl).unwrap().is_empty());
+}
+
+/// --open-only hides the record, but the host must still be rescanned on resume.
+#[tokio::test]
+async fn open_only_omits_an_interrupted_host_without_marking_it_completed() {
+    let dir = tempdir().unwrap();
+    let jsonl = dir.path().join("hosts.jsonl");
+    let state = dir.path().join("scan.state");
+    let metrics = run_interrupted(settings(), &jsonl, &state).await;
+
+    assert_eq!(metrics.hosts_interrupted, 1);
+    assert!(std::fs::read(&jsonl).unwrap().is_empty());
+    let saved: Checkpoint = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    assert!(saved.completed_hosts.is_empty());
+    assert_eq!(saved.output_position, 0);
 }

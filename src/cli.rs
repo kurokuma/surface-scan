@@ -87,6 +87,14 @@ pub struct Cli {
     /// Host-centric JSONL output.
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
+    /// Omit hosts without open ports from the host JSONL (default: true; --open-only=false keeps them).
+    #[arg(
+        long = "open-only",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    pub open_only: Option<bool>,
     /// Service-level CSV output.
     #[arg(long)]
     pub csv: Option<PathBuf>,

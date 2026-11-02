@@ -303,6 +303,7 @@ impl Pipeline {
             if let Some(host) = completed {
                 persist_host(
                     &host,
+                    self.settings.keeps_host(&host),
                     &mut metrics,
                     &mut writers,
                     &mut checkpoint,
@@ -395,13 +396,16 @@ fn finish_host(
 
 fn persist_host(
     host: &HostResult,
+    write_output: bool,
     metrics: &mut Metrics,
     writers: &mut OutputWriters,
     checkpoint: &mut Checkpoint,
     checkpoint_path: Option<&std::path::Path>,
 ) -> Result<()> {
     update_metrics(metrics, host);
-    writers.write_host(host)?;
+    if write_output {
+        writers.write_host(host)?;
+    }
     let flushed_position = writers.flush()?;
     checkpoint
         .discovered_open_ports
